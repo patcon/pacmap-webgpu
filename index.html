@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PaCMAP on WebGPU — MNIST</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: #0e0f13; color: #d7dae0;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header { padding: 10px 14px; border-bottom: 1px solid #23262e; display: flex;
+           gap: 14px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 13px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  label { color: #878d99; }
+  select, button {
+    background: #1a1d24; color: #d7dae0; border: 1px solid #2e323c;
+    border-radius: 4px; padding: 4px 8px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: #232733; }
+  button:disabled { opacity: .45; cursor: default; }
+  .stat { color: #878d99; }
+  .stat b { color: #d7dae0; font-weight: 600; }
+  #view { flex: 1; width: 100%; display: block; min-height: 0; }
+  footer { padding: 8px 14px; border-top: 1px solid #23262e; display: flex;
+           gap: 14px; align-items: center; flex-wrap: wrap; }
+  #legend { display: flex; gap: 5px; }
+  .swatch {
+    width: 20px; height: 20px; border-radius: 3px; display: grid;
+    place-items: center; background: var(--c); color: #0e0f13;
+    font-weight: 700; font-size: 11px;
+  }
+  #status { color: #878d99; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>PaCMAP · WebGPU · MNIST</h1>
+    <label>points
+      <select id="samples">
+        <option value="1000">1,000</option>
+        <option value="3000" selected>3,000</option>
+        <option value="5000">5,000</option>
+        <option value="10000">10,000 (slow setup)</option>
+      </select>
+    </label>
+    <label>iters/frame
+      <select id="speed">
+        <option value="1">1</option>
+        <option value="3" selected>3</option>
+        <option value="10">10</option>
+        <option value="450">all at once</option>
+      </select>
+    </label>
+    <button id="start">Run</button>
+    <span class="stat">iter <b id="iter">—</b></span>
+    <span class="stat">phase <b id="phase">—</b></span>
+  </header>
+  <canvas id="view"></canvas>
+  <footer>
+    <div id="legend"></div>
+    <span id="status">Ready. Setup (kNN + pairs) runs on the CPU; the 450-iteration optimization runs entirely on the GPU.</span>
+  </footer>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
