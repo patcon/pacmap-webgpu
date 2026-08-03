@@ -32,17 +32,20 @@ const status = (m: string) => (statusEl.textContent = m);
 
 // ---------------------------------------------------------------------------
 // URL switches
-//   ?knn=gpu|nnd  pick the kNN backend (default cpu brute force)
-//   ?knncheck=1   run every backend over one input and report how they compare
+//   ?algo=localmap  run LocalMAP rather than PaCMAP (default pacmap)
+//   ?knn=gpu|nnd    pick the kNN backend (default cpu brute force)
+//   ?knncheck=1     run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
 type KnnMode = "gpu" | "cpu" | "nndescent";
+type Variant = "pacmap" | "localmap";
 
 const qs = new URLSearchParams(location.search);
 const KNN_MODE: KnnMode =
   qs.get("knn") === "gpu" ? "gpu"
   : qs.get("knn") === "nnd" || qs.get("knn") === "nndescent" ? "nndescent"
   : "cpu";
+const ALGO_MODE: Variant = qs.get("algo") === "localmap" ? "localmap" : "pacmap";
 const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
@@ -106,6 +109,10 @@ async function go() {
     if (KNN_CHECK) await knnSelfCheck(device, Z, N);
 
     const knnLabel = KNN_LABELS[params.knnMethod];
+    // Read once, here: the folder is disabled for the duration of the run, so
+    // these are the values this run is committed to.
+    const variant = params.variant;
+    const algoLabel = ALGO_LABELS[variant];
     status(
       `PCA ${tPca | 0}ms · building kNN graph (${knnLabel}) + sampling pairs…`
     );
@@ -114,6 +121,8 @@ async function go() {
     const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
       seed: params.seed,
       knn: params.knnMethod,
+      variant,
+      lowDistThres: params.lowDistThres,
       nNeighbors: params.autoNeighbors ? undefined : params.nNeighbors,
       mnRatio: params.mnRatio,
       fpRatio: params.fpRatio,
@@ -318,7 +327,7 @@ async function go() {
 
     // --- Animate -----------------------------------------------------------
     status(
-      `${N} points · PCA ${tPca | 0}ms · ` +
+      `${N} points · ${algoLabel} · PCA ${tPca | 0}ms · ` +
         `kNN+pairs ${tSetup | 0}ms (${knnLabel}) · optimizing…`
     );
 
@@ -353,7 +362,7 @@ async function go() {
 
     const mb = ((frameCount * frameBytes) / (1 << 20)).toFixed(0);
     status(
-      `${N} points · PCA ${tPca | 0}ms · ` +
+      `${N} points · ${algoLabel} · PCA ${tPca | 0}ms · ` +
         `kNN+pairs ${tSetup | 0}ms (${knnLabel}) · ` +
         `${pm.totalIters} iters in ${elapsed | 0}ms ` +
         `(${(elapsed / pm.totalIters).toFixed(2)}ms/iter, includes render + rAF) · ` +
@@ -382,9 +391,13 @@ async function go() {
       f = Math.round(f);
       const iter = frameIters[f];
       iterEl.textContent = `${iter} / ${pm.totalIters}`;
+      // LocalMAP differs from PaCMAP only in phase 3, and only strictly after
+      // iteration 200 — same boundary the library applies to the near-pair
+      // coefficient.
       phaseEl.textContent =
         iter <= 100 ? "1 · global (w_MN 1000→3)"
         : iter <= 200 ? "2 · local refine"
+        : variant === "localmap" ? "3 · attract-repel + local graph"
         : "3 · attract-repel";
       readoutEl.textContent = `frame ${f + 1} / ${frameCount}`;
     }
@@ -456,15 +469,24 @@ const params = {
   mnRatio: 0.5,
   fpRatio: 2.0,
   seed: 7,
-  // Seeded from ?knn= so the URL still works, but the dropdown owns it after
-  // that — comparing backends is the point, and that shouldn't need a reload.
+  // Seeded from ?knn= / ?algo= so the URLs still work, but the dropdowns own
+  // them after that — comparing backends and variants is the point, and that
+  // shouldn't need a reload.
   knnMethod: KNN_MODE,
+  variant: ALGO_MODE,
+  // Upstream's default. Only read under localmap.
+  lowDistThres: 10,
 };
 
 const KNN_LABELS: Record<KnnMode, string> = {
   gpu: "brute force (GPU)",
   nndescent: "NN-Descent (GPU)",
   cpu: "brute force (CPU)",
+};
+
+const ALGO_LABELS: Record<Variant, string> = {
+  pacmap: "PaCMAP",
+  localmap: "LocalMAP",
 };
 
 const pane = new Pane({
@@ -482,7 +504,37 @@ viewFolder
   })
   .on("change", () => onViewChange?.());
 
-const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
+const pacmapFolder = pane.addFolder({ title: "algorithm · next run" });
+
+// LocalMAP inherits every parameter below this, so it is a variant here rather
+// than a separate folder — which is also how upstream models it.
+//
+// The map is annotated rather than inferred on purpose. Tweakpane types
+// `options` as plain strings, so a typo in a *value* here type-checks, and the
+// library's `opts.variant ?? "pacmap"` would then quietly run PaCMAP while this
+// pane claimed otherwise. `Record<string, Variant>` is what makes that a build
+// error. (The kNN dropdown below has the same hole; separate change.)
+const ALGO_OPTIONS: Record<string, Variant> = {
+  [ALGO_LABELS.pacmap]: "pacmap",
+  [ALGO_LABELS.localmap]: "localmap",
+};
+
+pacmapFolder
+  .addBinding(params, "variant", { label: "algorithm", options: ALGO_OPTIONS })
+  .on("change", (e) => {
+    lowDistBinding.disabled = e.value === "pacmap";
+  });
+
+// LocalMAP's only new knob. Read in two places — it scales the phase-3 near-pair
+// gradient (as lowDistThres/2) and bounds how far a redrawn further pair may sit
+// in the embedding — so it is one slider, not two. Inert under pacmap.
+const lowDistBinding = pacmapFolder.addBinding(params, "lowDistThres", {
+  label: "low_dist_thres",
+  min: 2,
+  max: 30,
+  step: 0.5,
+});
+lowDistBinding.disabled = params.variant === "pacmap";
 
 // Ordered by how much the backend takes on trust: the CPU oracle first as the
 // default, then the exact GPU kernel, then the approximate one. No speed

@@ -17,11 +17,14 @@ One commit per task, straight to `main`. Both gates after every task:
             trailing factor exactly `1.0 + 0.0*inverseSqrt(dd)`, and `dd >= 1` always,
             so there is no NaN/Inf path and `x * 1.0` is exact in IEEE754
 
-- [ ] **2. Demo controls for the variant** — S — deps: 1
+- [x] **2. Demo controls for the variant** — S — deps: 1
       `src/main.ts`
-      - [ ] `algorithm` dropdown in the `pacmap · next run` folder, seeded from `?algo=localmap`
-      - [ ] `low_dist_thres` slider (2–30, step 0.5, default 10), disabled under `pacmap`
-      - [ ] variant shown in the status line beside the kNN label
+      - [x] `algorithm` dropdown in the folder (retitled `algorithm · next run`), seeded from `?algo=localmap`
+      - [x] `low_dist_thres` slider (2–30, step 0.5, default 10), disabled under `pacmap`
+      - [x] variant shown in the status line beside the kNN label
+      - [x] phase readout reads `3 · attract-repel + local graph` under localmap
+      - [x] dropdown option *values* type-checked (`Record<string, Variant>`) — Tweakpane
+            types `options` as plain strings, so a typo there silently ran PaCMAP
 
 ### ✅ Checkpoint: Phase 1
 - [ ] Both gates clean
