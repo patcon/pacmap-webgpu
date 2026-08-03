@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check:shaders": "esbuild scripts/check-shaders.ts --bundle --format=esm --platform=node --external:@kmamal/gpu --outfile=node_modules/.cache/check-shaders.mjs && node node_modules/.cache/check-shaders.mjs"
   },
   "devDependencies": {
+    "@kmamal/gpu": "^0.2.1",
     "@tweakpane/core": "^2.0.5",
+    "@types/node": "^26.1.2",
     "@webgpu/types": "^0.1.60",
     "typescript": "^5.6.0",
     "vite": "^5.4.0"
