@@ -26,6 +26,8 @@ Pipeline, in order (`src/main.ts` `go()` wires it all):
 3. `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
 4. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, playback transport, Tweakpane view controls, DOM/status.
 
+The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `pacmap` (the MN/FP pair ratios) is setup-time: pairs are sampled and the CSR built before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight.
+
 Tweakpane (the only runtime dependency) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
 
 ### Playback history (`main.ts`)

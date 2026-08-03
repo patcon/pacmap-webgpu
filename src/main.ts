@@ -169,6 +169,7 @@ async function go() {
   startBtn.disabled = true;
   const gen = ++runGen;
   resetTransport();
+  pacmapFolder.disabled = true; // setup-time params; this run is committed
 
   try {
     if (!navigator.gpu) throw new Error("WebGPU unavailable in this browser");
@@ -203,6 +204,8 @@ async function go() {
     const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
       seed: 7,
       knn: KNN_MODE,
+      mnRatio: params.mnRatio,
+      fpRatio: params.fpRatio,
       onStatus: status,
     });
     const tSetup = performance.now() - t1;
@@ -500,6 +503,7 @@ async function go() {
     running = false;
     startBtn.disabled = false;
     sampleSel.disabled = false;
+    pacmapFolder.disabled = false;
   }
 }
 
@@ -519,11 +523,25 @@ const view = { pointSize: 1.8 };
 /** Installed by a run so an edit can rewrite that run's view uniform. */
 let onViewChange: (() => void) | null = null;
 
+/**
+ * PaCMAP pair ratios. n_MN and n_FP are counts per point, derived as
+ * round(n_neighbors * ratio) inside the library, so these are the knobs the
+ * reference exposes rather than the counts themselves.
+ *
+ * Unlike point size these are setup-time: the pairs are sampled and the CSR is
+ * built once, before the first iteration, so an edit cannot apply to a run
+ * already in flight. The folder is disabled while one is running and the values
+ * are read at the top of the next `go()`.
+ */
+const params = { mnRatio: 0.5, fpRatio: 2.0 };
+
 const pane = new Pane({
   container: document.getElementById("pane") as HTMLElement,
-  title: "view",
+  title: "controls",
 });
-pane
+
+const viewFolder = pane.addFolder({ title: "view" });
+viewFolder
   .addBinding(view, "pointSize", {
     label: "point size",
     min: 0.2,
@@ -531,6 +549,24 @@ pane
     step: 0.1,
   })
   .on("change", () => onViewChange?.());
+
+const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
+// Ranges bracket the reference defaults (0.5 / 2.0) generously enough to see
+// the structure change: dropping MN toward 0 loses global layout, raising FP
+// pushes clusters apart. 0 is a legal value for both — it just drops that pair
+// kind entirely.
+pacmapFolder.addBinding(params, "mnRatio", {
+  label: "MN ratio",
+  min: 0,
+  max: 3,
+  step: 0.05,
+});
+pacmapFolder.addBinding(params, "fpRatio", {
+  label: "FP ratio",
+  min: 0,
+  max: 6,
+  step: 0.05,
+});
 
 // ---------------------------------------------------------------------------
 // Transport (play/pause + scrubber)
