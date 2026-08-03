@@ -9,9 +9,10 @@ npm install
 npm run dev      # vite dev server
 npm run build    # tsc --noEmit && vite build
 npm run preview
+npm run check:shaders   # compile every WGSL source under Dawn
 ```
 
-There is no test suite and no linter. `npm run build` (i.e. `tsc --noEmit`) is the only automated check. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`.
+There is no test suite and no linter. `npm run build` (i.e. `tsc --noEmit`) and `npm run check:shaders` are the two automated checks; CI runs both. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`, and `scripts/` is type-checked alongside `src/`.
 
 Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. Nothing can be verified headlessly — the whole pipeline runs in the browser.
 
@@ -52,7 +53,9 @@ There is a third backend, `nndescentGPU` (`knn: "nndescent"`), approximate rathe
 
 `?knncheck=1` runs every backend over one identical input, scoring each against the CPU oracle, and reports recall / exact-order / max rel Δd² / ms. `?knn=gpu|nnd` picks a backend, as does the pane's `kNN algo` dropdown. The demo defaults to the CPU oracle: it is exact, and measured, it is also the fastest of the three at the sizes this demo runs — which is not what its O(N²·D) in plain JS would suggest. Treat any speed claim about these backends as something to re-measure with `?knncheck=1` rather than derive.
 
-Note that the demo cannot be verified headlessly, but the *library* can: `npx esbuild src/pacmap-webgpu.ts --bundle --format=esm --platform=neutral` produces a bundle that runs under `@kmamal/gpu` (Dawn bindings for Node), which compiles the real WGSL and executes the kernels. Both kNN shaders shipped broken once because they were committed without ever being compiled — a WGSL parse error takes out every pipeline at once and the failure looks like a plausible blob rather than an error. Compile shaders before committing them.
+Note that the demo cannot be verified headlessly, but the *library* can: bundling with esbuild (`--format=esm --platform=neutral`) produces something that runs under `@kmamal/gpu` (Dawn bindings for Node), which compiles the real WGSL and executes the kernels. Both kNN shaders shipped broken once because they were committed without ever being compiled — a WGSL parse error takes out every pipeline at once and the failure looks like a plausible blob rather than an error.
+
+`npm run check:shaders` is that mechanism, standing: `scripts/check-shaders.ts` compiles all five WGSL sources under Dawn and builds the real pipeline for every entry point. Pipelines matter as much as modules — a renamed entry point, an incompatible bind-group layout, or a bad vertex/blend state compiles clean and fails only at `createPipeline`. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader.
 
 Three design decisions carry most of the file:
 

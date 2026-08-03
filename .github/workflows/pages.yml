@@ -31,6 +31,32 @@ jobs:
         with:
           path: dist
 
+  # Runs alongside build rather than gating it: a WGSL regression should be
+  # reported, but it can't break a page that tsc and vite already accepted.
+  shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # The runner has no GPU, so Dawn needs a software Vulkan ICD (lavapipe).
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      # node_modules whole, not just ~/.npm: @kmamal/gpu pulls a ~16MB Dawn
+      # binary straight into its own dist/ from a postinstall step, so the npm
+      # tarball cache doesn't cover it and `npm ci` would wipe any narrower
+      # cache path before the install could benefit from it.
+      - id: modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+      - if: steps.modules.outputs.cache-hit != 'true'
+        run: npm ci
+      # --strict: no adapter is a broken runner, not a reason to pass quietly.
+      - run: npm run check:shaders -- --strict
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
