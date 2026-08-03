@@ -1103,6 +1103,17 @@ function weightsAt(
 // Shaders
 // ---------------------------------------------------------------------------
 
+/**
+ * Every WGSL source in this file, exposed so `scripts/check-shaders.ts` can
+ * compile them headlessly. Nothing at runtime reads this — the pipelines call
+ * the functions directly.
+ */
+export const shaderSources = {
+  knnShaderSource,
+  nndShaderSource,
+  shaderSource,
+};
+
 function shaderSource(N: number): string {
   return /* wgsl */ `
 struct Params {
