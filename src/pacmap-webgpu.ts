@@ -412,7 +412,9 @@ const R : u32 = ${R}u;
 // Counter-based hash RNG. Stateless, so a thread can derive its whole draw
 // sequence from (seed, i, k) without carrying state between dispatches.
 fn hash3(a : u32, b : u32, c : u32) -> u32 {
-  var h = a * 0x9E3779B1u ^ b * 0x85EBCA6Bu ^ c * 0xC2B2AE35u;
+  // WGSL defines no relative precedence between bitwise and arithmetic
+  // operators, so the parens are required, not style.
+  var h = (a * 0x9E3779B1u) ^ (b * 0x85EBCA6Bu) ^ (c * 0xC2B2AE35u);
   h = h ^ (h >> 16u); h = h * 0x7FEB352Du;
   h = h ^ (h >> 15u); h = h * 0x846CA68Bu;
   return h ^ (h >> 16u);
@@ -652,9 +654,44 @@ export async function nndescentGPU(
   const module = device.createShaderModule({
     code: nndShaderSource(N, D, K, R),
   });
+
+  // The layout is declared explicitly rather than left to `layout: "auto"`.
+  // Auto derives a *separate* layout per entry point containing only the
+  // bindings that entry point actually reads — nnd_init never touches the
+  // reverse lists or the update counter, so its auto layout would have four
+  // bindings, not seven, and one shared bind group would fail validation
+  // against it. Declaring the full set once lets all four pipelines share a
+  // single layout and a single bind group.
+  const storageEntry = (
+    binding: number,
+    type: GPUBufferBindingType
+  ): GPUBindGroupLayoutEntry => ({
+    binding,
+    visibility: GPUShaderStage.COMPUTE,
+    buffer: { type },
+  });
+  const layout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "storage"),
+      storageEntry(2, "storage"),
+      storageEntry(3, "storage"),
+      storageEntry(4, "storage"),
+      storageEntry(5, "storage"),
+      {
+        binding: 6,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "uniform" },
+      },
+    ],
+  });
+  const pipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [layout],
+  });
+
   const mkPipe = (entryPoint: string) =>
     device.createComputePipeline({
-      layout: "auto",
+      layout: pipelineLayout,
       compute: { module, entryPoint },
     });
   const initPipe = mkPipe("nnd_init");
@@ -662,24 +699,18 @@ export async function nndescentGPU(
   const revPipe = mkPipe("nnd_reverse");
   const joinPipe = mkPipe("nnd_join");
 
-  // "auto" layout derives a separate layout object per pipeline, but all four
-  // entry points declare the identical binding set, so one bind group per
-  // pipeline over the same buffers is all this needs.
-  const entries: GPUBindGroupEntry[] = [
-    { binding: 0, resource: { buffer: xBuf } },
-    { binding: 1, resource: { buffer: nbrIBuf } },
-    { binding: 2, resource: { buffer: nbrDBuf } },
-    { binding: 3, resource: { buffer: revIBuf } },
-    { binding: 4, resource: { buffer: revCBuf } },
-    { binding: 5, resource: { buffer: updBuf } },
-    { binding: 6, resource: { buffer: pBuf } },
-  ];
-  const bgFor = (p: GPUComputePipeline) =>
-    device.createBindGroup({ layout: p.getBindGroupLayout(0), entries });
-  const initBG = bgFor(initPipe);
-  const clearBG = bgFor(clearPipe);
-  const revBG = bgFor(revPipe);
-  const joinBG = bgFor(joinPipe);
+  const bindGroup = device.createBindGroup({
+    layout,
+    entries: [
+      { binding: 0, resource: { buffer: xBuf } },
+      { binding: 1, resource: { buffer: nbrIBuf } },
+      { binding: 2, resource: { buffer: nbrDBuf } },
+      { binding: 3, resource: { buffer: revIBuf } },
+      { binding: 4, resource: { buffer: revCBuf } },
+      { binding: 5, resource: { buffer: updBuf } },
+      { binding: 6, resource: { buffer: pBuf } },
+    ],
+  });
 
   const allGroups = Math.ceil(N / NND_WG);
   const range = new Uint32Array(4);
@@ -694,7 +725,7 @@ export async function nndescentGPU(
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(initPipe);
-    pass.setBindGroup(0, initBG);
+    pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(allGroups);
     pass.end();
     device.queue.submit([enc.finish()]);
@@ -722,10 +753,10 @@ export async function nndescentGPU(
       const enc = device.createCommandEncoder();
       const pass = enc.beginComputePass();
       pass.setPipeline(clearPipe);
-      pass.setBindGroup(0, clearBG);
+      pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(allGroups);
       pass.setPipeline(revPipe);
-      pass.setBindGroup(0, revBG);
+      pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(allGroups);
       pass.end();
       device.queue.submit([enc.finish()]);
@@ -741,7 +772,7 @@ export async function nndescentGPU(
       const enc = device.createCommandEncoder();
       const pass = enc.beginComputePass();
       pass.setPipeline(joinPipe);
-      pass.setBindGroup(0, joinBG);
+      pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(Math.ceil((end - q) / NND_WG));
       pass.end();
       device.queue.submit([enc.finish()]);
