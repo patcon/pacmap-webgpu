@@ -37,10 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No `cache: npm` here. The node_modules cache below already covers this
+      # job, and racing `build` for the same ~/.npm key just logs a save failure.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
       # The runner has no GPU, so Dawn needs a software Vulkan ICD (lavapipe).
       - run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
       # node_modules whole, not just ~/.npm: @kmamal/gpu pulls a ~16MB Dawn
