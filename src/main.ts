@@ -6,6 +6,7 @@ import {
 } from "./pacmap-webgpu";
 import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
+import { Pane } from "tweakpane";
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -328,13 +329,20 @@ async function go() {
         canvas.width = w;
         canvas.height = h;
       }
-      const radius = Math.max(1.5, 2.6 * dpr) * (N > 8000 ? 0.7 : 1);
+      // The slider is in CSS px; 1.5 framebuffer px is the floor below which
+      // points stop resolving at all.
+      const radius = Math.max(1.5, view.pointSize * dpr);
       device.queue.writeBuffer(
         viewUniform,
         0,
         new Float32Array([canvas.width, canvas.height, radius, 0])
       );
     }
+    // Point-size edits land immediately, even mid-run when nothing else is
+    // rewriting the view uniform.
+    onViewChange = () => {
+      if (gen === runGen) resize();
+    };
     window.addEventListener("resize", () => {
       if (gen === runGen) resize();
     });
@@ -498,6 +506,31 @@ async function go() {
 function frame(): Promise<void> {
   return new Promise((r) => requestAnimationFrame(() => r()));
 }
+
+// ---------------------------------------------------------------------------
+// Tweakpane
+// ---------------------------------------------------------------------------
+
+// The dense default (what the fixed radius used to be above 8k points) is the
+// default at every N — a size that stays readable when crowded is a fine
+// starting point when it isn't, and the slider is right there.
+const view = { pointSize: 1.8 };
+
+/** Installed by a run so an edit can rewrite that run's view uniform. */
+let onViewChange: (() => void) | null = null;
+
+const pane = new Pane({
+  container: document.getElementById("pane") as HTMLElement,
+  title: "view",
+});
+pane
+  .addBinding(view, "pointSize", {
+    label: "point size",
+    min: 0.2,
+    max: 8,
+    step: 0.1,
+  })
+  .on("change", () => onViewChange?.());
 
 // ---------------------------------------------------------------------------
 // Transport (play/pause + scrubber)
