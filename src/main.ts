@@ -30,12 +30,17 @@ const status = (m: string) => (statusEl.textContent = m);
 
 // ---------------------------------------------------------------------------
 // URL switches
-//   ?knn=cpu      use the O(N^2*D) CPU reference instead of the GPU kernel
-//   ?knncheck=1   run both and report how closely they agree
+//   ?knn=cpu|nnd  pick the kNN backend (default gpu brute force)
+//   ?knncheck=1   run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
+type KnnMode = "gpu" | "cpu" | "nndescent";
+
 const qs = new URLSearchParams(location.search);
-const KNN_MODE = qs.get("knn") === "cpu" ? "cpu" : "gpu";
+const KNN_MODE: KnnMode =
+  qs.get("knn") === "cpu" ? "cpu"
+  : qs.get("knn") === "nnd" || qs.get("knn") === "nndescent" ? "nndescent"
+  : "gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Playback history. Every captured frame is a full N x 2 f32 snapshot kept in

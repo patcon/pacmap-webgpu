@@ -9,8 +9,12 @@
  * host round-trip. Y never leaves the GPU unless you ask for it, so the position
  * buffer can be bound directly as a vertex attribute for per-iteration rendering.
  *
+ * Three kNN backends, all producing the identical N x kCand output contract:
+ * `bruteForceKnn` (CPU, exact, the oracle), `knnGPU` (WGSL, exact) and
+ * `nndescentGPU` (WGSL, approximate). Select with the `knn` option.
+ *
  * [Omitted for minimality: PCA-to-100d preprocessing, PCA init (using scaled
- *  gaussian instead), GPU brute-force kNN. All three are noted at their sites.]
+ *  gaussian instead). Both are noted at their sites.]
  */
 
 // ---------------------------------------------------------------------------
@@ -30,11 +34,15 @@ export interface PacmapOptions {
   lr?: number;
   seed?: number;
   /**
-   * Where to build the kNN graph. Default "gpu". "cpu" keeps the O(N^2*D)
-   * reference path, which is only tolerable below a few thousand points but is
-   * useful as a correctness oracle.
+   * Where and how to build the kNN graph. Default "gpu" (brute force).
+   *
+   * "cpu" keeps the O(N^2*D) reference path, which is only tolerable below a
+   * few thousand points but is useful as a correctness oracle. "nndescent" is
+   * approximate — see `nndescentGPU` for what that costs and buys.
    */
-  knn?: "gpu" | "cpu";
+  knn?: "gpu" | "cpu" | "nndescent";
+  /** Tuning for `knn: "nndescent"`. Ignored otherwise. */
+  nndescent?: Omit<NndOptions, "seed" | "onStatus">;
   /** Progress callback for the setup phase. */
   onStatus?: (msg: string) => void;
 }
@@ -102,11 +110,11 @@ function mkBuf(
  * distance. O(N^2 * D) with a bounded insertion sort per row.
  *
  * Superseded by `knnGPU` for anything but small N — this is ~40 minutes at 65k,
- * on whatever thread you call it from. Kept as the correctness oracle for the
- * GPU path (see the `?knncheck=1` mode in the demo) and as an escape hatch.
+ * on whatever thread you call it from. Kept as the correctness oracle for both
+ * GPU paths (see the `?knncheck=1` mode in the demo) and as an escape hatch.
  *
- * [NN-Descent would beat both above ~100k, where O(N^2) stops being viable even
- *  at GPU throughput.]
+ * Above ~100k, where O(N^2) stops being viable even at GPU throughput, neither
+ * brute-force path is usable and `nndescentGPU` is the one that still scales.
  */
 export function bruteForceKnn(
   X: Float32Array,
@@ -365,6 +373,444 @@ export async function knnGPU(
 
   for (const b of [xBuf, idxBuf, d2Buf, pBuf, stageI, stageD]) b.destroy();
   return { idx, d2 };
+}
+
+// ---------------------------------------------------------------------------
+// NN-Descent (GPU)
+// ---------------------------------------------------------------------------
+
+const NND_WG = 64;
+
+export interface NndOptions {
+  seed?: number;
+  /** Hard cap on descent iterations. Default 12. */
+  maxIters?: number;
+  /** Stop once updates in an iteration fall below delta*N*K. Default 0.001 */
+  delta?: number;
+  /** Reverse-neighbor list cap per point. Default 16. */
+  revCap?: number;
+  onStatus?: (msg: string) => void;
+}
+
+function nndShaderSource(N: number, D: number, K: number, R: number): string {
+  return /* wgsl */ `
+struct NParams { range : vec4<u32> };   // qStart, qEnd, seed, _
+
+@group(0) @binding(0) var<storage, read>       X    : array<f32>;
+@group(0) @binding(1) var<storage, read_write> NbrI : array<u32>;
+@group(0) @binding(2) var<storage, read_write> NbrD : array<f32>;
+@group(0) @binding(3) var<storage, read_write> RevI : array<u32>;
+@group(0) @binding(4) var<storage, read_write> RevC : array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> Upd  : array<atomic<u32>>;
+@group(0) @binding(6) var<uniform>             P    : NParams;
+
+const N : u32 = ${N}u;
+const D : u32 = ${D}u;
+const K : u32 = ${K}u;
+const R : u32 = ${R}u;
+
+// Counter-based hash RNG. Stateless, so a thread can derive its whole draw
+// sequence from (seed, i, k) without carrying state between dispatches.
+fn hash3(a : u32, b : u32, c : u32) -> u32 {
+  var h = a * 0x9E3779B1u ^ b * 0x85EBCA6Bu ^ c * 0xC2B2AE35u;
+  h = h ^ (h >> 16u); h = h * 0x7FEB352Du;
+  h = h ^ (h >> 15u); h = h * 0x846CA68Bu;
+  return h ^ (h >> 16u);
+}
+
+fn d2(i : u32, j : u32) -> f32 {
+  var s : f32 = 0.0;
+  let oi = i * D;
+  let oj = j * D;
+  for (var k : u32 = 0u; k < D; k = k + 1u) {
+    let diff = X[oi + k] - X[oj + k];
+    s = s + diff * diff;
+  }
+  return s;
+}
+
+// Random K distinct neighbors per point, distance-sorted. Fills all K slots, so
+// every later kernel can assume a full row and skip the count < K branch that
+// knn_main needs.
+@compute @workgroup_size(${NND_WG})
+fn nnd_init(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+
+  var hD : array<f32, ${K}>;
+  var hI : array<u32, ${K}>;
+  var count : u32 = 0u;
+
+  var draw : u32 = 0u;
+  loop {
+    if (count == K) { break; }
+    // N-1 >= K is guaranteed by the caller, so this terminates; the bound is
+    // only insurance against a pathological hash.
+    if (draw > 8u * K + 64u) { break; }
+    let c = hash3(P.range.z, i, draw) % N;
+    draw = draw + 1u;
+    if (c == i) { continue; }
+
+    var dup = false;
+    for (var k : u32 = 0u; k < count; k = k + 1u) {
+      if (hI[k] == c) { dup = true; break; }
+    }
+    if (dup) { continue; }
+
+    let s = d2(i, c);
+    var pos = count;
+    loop {
+      if (pos == 0u) { break; }
+      if (hD[pos - 1u] <= s) { break; }
+      hD[pos] = hD[pos - 1u];
+      hI[pos] = hI[pos - 1u];
+      pos = pos - 1u;
+    }
+    hD[pos] = s;
+    hI[pos] = c;
+    count = count + 1u;
+  }
+
+  // A short row would break the N x K contract. Pad by repeating the last entry
+  // rather than leaving garbage; the join will displace it on the first pass.
+  let base = i * K;
+  for (var k : u32 = 0u; k < K; k = k + 1u) {
+    let src = select(count - 1u, k, k < count);
+    NbrD[base + k] = hD[src];
+    NbrI[base + k] = hI[src];
+  }
+}
+
+@compute @workgroup_size(${NND_WG})
+fn nnd_clear(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  atomicStore(&RevC[i], 0u);
+  if (i == 0u) { atomicStore(&Upd[0], 0u); }
+}
+
+// Reverse adjacency, capped at R entries per point. Integer atomics only.
+//
+// The cap is what bounds worst-case join work: MNIST has hub points that
+// thousands of rows point at, and an uncapped reverse list would hand one
+// thread all of them. The cost is that WHICH R writers win is a race, so this
+// path is not bit-reproducible across runs even at a fixed seed. See the
+// nndescentGPU docstring.
+@compute @workgroup_size(${NND_WG})
+fn nnd_reverse(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  let base = i * K;
+  for (var k : u32 = 0u; k < K; k = k + 1u) {
+    let j = NbrI[base + k];
+    let s = atomicAdd(&RevC[j], 1u);
+    if (s < R) { RevI[j * R + s] = i; }
+  }
+}
+
+// One thread per point, owning row i and writing nothing else. Candidates are
+// the neighbors-of-neighbors set: for each b in fwd(i) + rev(i), scan
+// fwd(b) + rev(b). Best K survive in registers, same bounded insertion sort as
+// knn_main.
+//
+// Other threads are rewriting the rows this one reads. That is safe rather than
+// merely tolerated: only INDICES are read from foreign rows, never distances —
+// every distance is recomputed here from X. So a torn read yields a stale or
+// duplicated candidate index, which the dedup scan below already handles, and
+// never a mismatched index/distance pair. No double buffering needed.
+@compute @workgroup_size(${NND_WG})
+fn nnd_join(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = P.range.x + gid.x;
+  if (i >= P.range.y) { return; }
+
+  let base = i * K;
+  var hD : array<f32, ${K}>;
+  var hI : array<u32, ${K}>;
+  for (var k : u32 = 0u; k < K; k = k + 1u) {
+    hD[k] = NbrD[base + k];
+    hI[k] = NbrI[base + k];
+  }
+  var worst = hD[K - 1u];
+  var changed : u32 = 0u;
+
+  let revN = min(atomicLoad(&RevC[i]), R);
+  let outer = K + revN;
+
+  for (var o : u32 = 0u; o < outer; o = o + 1u) {
+    var b : u32;
+    if (o < K) { b = hI[o]; } else { b = RevI[i * R + (o - K)]; }
+    if (b >= N) { continue; }
+
+    let bRevN = min(atomicLoad(&RevC[b]), R);
+    let inner = K + bRevN;
+
+    for (var q : u32 = 0u; q < inner; q = q + 1u) {
+      var c : u32;
+      if (q < K) { c = NbrI[b * K + q]; } else { c = RevI[b * R + (q - K)]; }
+      if (c == i || c >= N) { continue; }
+
+      let s = d2(i, c);
+      if (s >= worst) { continue; }
+
+      var dup = false;
+      for (var k : u32 = 0u; k < K; k = k + 1u) {
+        if (hI[k] == c) { dup = true; break; }
+      }
+      if (dup) { continue; }
+
+      var pos = K - 1u;
+      loop {
+        if (pos == 0u) { break; }
+        if (hD[pos - 1u] <= s) { break; }
+        hD[pos] = hD[pos - 1u];
+        hI[pos] = hI[pos - 1u];
+        pos = pos - 1u;
+      }
+      hD[pos] = s;
+      hI[pos] = c;
+      worst = hD[K - 1u];
+      changed = changed + 1u;
+    }
+  }
+
+  if (changed > 0u) {
+    for (var k : u32 = 0u; k < K; k = k + 1u) {
+      NbrD[base + k] = hD[k];
+      NbrI[base + k] = hI[k];
+    }
+    atomicAdd(&Upd[0], changed);
+  }
+}
+`;
+}
+
+/**
+ * Approximate kNN by NN-Descent, as a drop-in alternative to `knnGPU`. Same
+ * return shape and ordering (N x kCand row-major, ascending by squared
+ * distance), so `samplePairs` cannot tell them apart.
+ *
+ * Approximate is the operative word: expect recall around 0.95 rather than the
+ * 1.0 the brute-force paths give. That is the same trade the reference PaCMAP
+ * makes — it uses ANNOY — so this is arguably closer to upstream than the exact
+ * paths are. Measure it with the demo's `?knncheck=1`.
+ *
+ * Two properties differ from `knnGPU` beyond recall:
+ *
+ * - **Not bit-reproducible.** The reverse-list cap is first-R-writers-win, and
+ *   that race is not seeded. Same seed, slightly different graph, slightly
+ *   different layout. `knnGPU` and `bruteForceKnn` remain deterministic.
+ * - **Cost is `~N*K^2*D` per iteration**, not `N^2*D`. Since `candidateCount`
+ *   asks for `nNB + 50` candidates, K is large (60 by default) and K^2 is close
+ *   enough to N at MNIST scale that this does not reliably win. It is the
+ *   asymptotics that matter — past ~100k, where N^2 stops being viable at any
+ *   throughput, this is the only one of the three still standing.
+ */
+export async function nndescentGPU(
+  device: GPUDevice,
+  X: Float32Array,
+  N: number,
+  D: number,
+  kCand: number,
+  opts: NndOptions = {}
+): Promise<{ idx: Uint32Array; d2: Float32Array }> {
+  if (kCand < 1) throw new Error("kCand must be >= 1");
+  if (kCand > N - 1) throw new Error("kCand must be <= N-1");
+
+  const K = kCand;
+  const R = opts.revCap ?? 16;
+  const maxIters = opts.maxIters ?? 12;
+  const delta = opts.delta ?? 0.001;
+  const seed = opts.seed ?? 42;
+  const onStatus = opts.onStatus ?? (() => {});
+
+  const S = GPUBufferUsage.STORAGE;
+  const outBytes = N * K * 4;
+  const xBuf = mkBuf(device, X, S);
+  const nbrIBuf = device.createBuffer({
+    size: outBytes,
+    usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const nbrDBuf = device.createBuffer({
+    size: outBytes,
+    usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const revIBuf = device.createBuffer({ size: N * R * 4, usage: S });
+  const revCBuf = device.createBuffer({ size: N * 4, usage: S });
+  const updBuf = device.createBuffer({
+    size: 4,
+    usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const pBuf = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const updStage = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  const module = device.createShaderModule({
+    code: nndShaderSource(N, D, K, R),
+  });
+  const mkPipe = (entryPoint: string) =>
+    device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint },
+    });
+  const initPipe = mkPipe("nnd_init");
+  const clearPipe = mkPipe("nnd_clear");
+  const revPipe = mkPipe("nnd_reverse");
+  const joinPipe = mkPipe("nnd_join");
+
+  // "auto" layout derives a separate layout object per pipeline, but all four
+  // entry points declare the identical binding set, so one bind group per
+  // pipeline over the same buffers is all this needs.
+  const entries: GPUBindGroupEntry[] = [
+    { binding: 0, resource: { buffer: xBuf } },
+    { binding: 1, resource: { buffer: nbrIBuf } },
+    { binding: 2, resource: { buffer: nbrDBuf } },
+    { binding: 3, resource: { buffer: revIBuf } },
+    { binding: 4, resource: { buffer: revCBuf } },
+    { binding: 5, resource: { buffer: updBuf } },
+    { binding: 6, resource: { buffer: pBuf } },
+  ];
+  const bgFor = (p: GPUComputePipeline) =>
+    device.createBindGroup({ layout: p.getBindGroupLayout(0), entries });
+  const initBG = bgFor(initPipe);
+  const clearBG = bgFor(clearPipe);
+  const revBG = bgFor(revPipe);
+  const joinBG = bgFor(joinPipe);
+
+  const allGroups = Math.ceil(N / NND_WG);
+  const range = new Uint32Array(4);
+  const t0 = performance.now();
+
+  // --- Init --------------------------------------------------------------
+  range[0] = 0;
+  range[1] = N;
+  range[2] = seed >>> 0;
+  device.queue.writeBuffer(pBuf, 0, range);
+  {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(initPipe);
+    pass.setBindGroup(0, initBG);
+    pass.dispatchWorkgroups(allGroups);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+  onStatus(`NN-Descent: random init done (${N} points, k=${K})…`);
+
+  // --- Descent -----------------------------------------------------------
+  // Same adaptive chunking as knnGPU, for the same reason: one dispatch over
+  // all N runs for seconds at scale and trips the ~2s OS GPU watchdog.
+  //
+  // Unlike knnGPU's chunks these are NOT independent — a later chunk reads rows
+  // an earlier one already improved. For NN-Descent that is benign and if
+  // anything accelerates convergence (pynndescent updates in place too); the
+  // graph is a fixed point being approached, not a partitioned output.
+  const TARGET_MS = 40;
+  const stopBelow = delta * N * K;
+  let chunk = Math.max(NND_WG, Math.min(N, Math.ceil(2e8 / (K * K * D))));
+  let iters = 0;
+  let lastUpd = 0;
+
+  for (let iter = 0; iter < maxIters; iter++) {
+    // Reverse lists are rebuilt from the current graph each iteration.
+    {
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(clearPipe);
+      pass.setBindGroup(0, clearBG);
+      pass.dispatchWorkgroups(allGroups);
+      pass.setPipeline(revPipe);
+      pass.setBindGroup(0, revBG);
+      pass.dispatchWorkgroups(allGroups);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+
+    let q = 0;
+    while (q < N) {
+      const end = Math.min(q + chunk, N);
+      range[0] = q;
+      range[1] = end;
+      device.queue.writeBuffer(pBuf, 0, range);
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(joinPipe);
+      pass.setBindGroup(0, joinBG);
+      pass.dispatchWorkgroups(Math.ceil((end - q) / NND_WG));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+
+      const t = performance.now();
+      await device.queue.onSubmittedWorkDone();
+      const dt = Math.max(performance.now() - t, 0.1);
+
+      q = end;
+      const scale = Math.min(4, Math.max(0.25, TARGET_MS / dt));
+      chunk = Math.max(NND_WG, Math.min(N, Math.round(chunk * scale)));
+
+      const pct = ((q / N) * 100) | 0;
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      onStatus(
+        `NN-Descent iter ${iter + 1}/${maxIters}… ${pct}% (${secs}s)`
+      );
+    }
+
+    // A 4-byte readback per iteration. Cheap, and it doubles as the host yield
+    // point — this library stays DOM-free, so there is no rAF to hand back to.
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(updBuf, 0, updStage, 0, 4);
+    device.queue.submit([enc.finish()]);
+    await updStage.mapAsync(GPUMapMode.READ);
+    lastUpd = new Uint32Array(updStage.getMappedRange())[0];
+    updStage.unmap();
+
+    iters = iter + 1;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    onStatus(
+      `NN-Descent iter ${iters}/${maxIters}: ${lastUpd} updates (${secs}s)`
+    );
+    if (lastUpd < stopBelow) break;
+  }
+
+  onStatus(
+    `NN-Descent converged in ${iters} iters ` +
+      `(${lastUpd} final updates, ${((performance.now() - t0) / 1000).toFixed(1)}s)`
+  );
+
+  // --- Readback ----------------------------------------------------------
+  const stageI = device.createBuffer({
+    size: outBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const stageD = device.createBuffer({
+    size: outBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(nbrIBuf, 0, stageI, 0, outBytes);
+  enc.copyBufferToBuffer(nbrDBuf, 0, stageD, 0, outBytes);
+  device.queue.submit([enc.finish()]);
+
+  await stageI.mapAsync(GPUMapMode.READ);
+  await stageD.mapAsync(GPUMapMode.READ);
+  const idx = new Uint32Array(stageI.getMappedRange().slice(0));
+  const dd = new Float32Array(stageD.getMappedRange().slice(0));
+  stageI.unmap();
+  stageD.unmap();
+
+  for (const b of [
+    xBuf, nbrIBuf, nbrDBuf, revIBuf, revCBuf, updBuf, pBuf,
+    updStage, stageI, stageD,
+  ]) {
+    b.destroy();
+  }
+  return { idx, d2: dd };
 }
 
 function dist2(X: Float32Array, D: number, a: number, b: number): number {
@@ -675,7 +1121,13 @@ export async function pacmapWebGPU(
   const knn =
     opts.knn === "cpu"
       ? bruteForceKnn(X, N, D, kCand)
-      : await knnGPU(device, X, N, D, kCand, onStatus);
+      : opts.knn === "nndescent"
+        ? await nndescentGPU(device, X, N, D, kCand, {
+            ...opts.nndescent,
+            seed: opts.seed ?? 42,
+            onStatus,
+          })
+        : await knnGPU(device, X, N, D, kCand, onStatus);
 
   onStatus("Sampling pairs…");
   const pairs = samplePairs(X, N, D, nNB, nMN, nFP, rand, knn, kCand);
