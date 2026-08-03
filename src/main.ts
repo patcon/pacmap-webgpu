@@ -2,6 +2,7 @@ import {
   pacmapWebGPU,
   bruteForceKnn,
   knnGPU,
+  nndescentGPU,
   defaultNeighbors,
   type PacmapRun,
 } from "./pacmap-webgpu";
@@ -668,33 +669,33 @@ window.addEventListener("keydown", (e) => {
 // kNN self-check (?knncheck=1)
 // ---------------------------------------------------------------------------
 
+interface KnnAgreement {
+  recall: number;
+  exactOrder: number;
+  maxRel: number;
+}
+
 /**
- * Runs the CPU reference and the GPU kernel over the same input and reports how
- * closely they agree.
+ * Scores one backend's output against the CPU oracle's.
  *
- * They will not agree bit-for-bit — JS accumulates distances in f64, WGSL in
- * f32 — so near-ties legitimately swap order and comparing index arrays for
- * equality would cry wolf. Recall is the metric that would actually catch a
- * broken kernel; exact-order agreement is reported only as colour.
+ * Nothing here will agree bit-for-bit even among the exact backends — JS
+ * accumulates distances in f64, WGSL in f32 — so near-ties legitimately swap
+ * order and comparing index arrays for equality would cry wolf. Recall is the
+ * metric that would actually catch a broken kernel.
+ *
+ * The other two need reading differently depending on the backend. For an exact
+ * backend, a low exact-order score or a large max rel Δd² means a bug. For an
+ * approximate one both are *expected* to move: NN-Descent legitimately returns
+ * a different neighbor at some positions, and max rel Δd² then measures how
+ * much worse that substitute is — which is the useful thing to know about it,
+ * not a defect.
  */
-async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
-  // Capped: the CPU reference is O(N^2*D), so checking at full 65k would take
-  // ~40 minutes. A prefix is a perfectly valid comparison — both paths see the
-  // identical input.
-  const M = Math.min(N, 2000);
-  const kCand = Math.min(60, M - 1);
-  const Zm = Z.subarray(0, M * 100);
-
-  status(`kNN self-check at ${M} points: CPU reference…`);
-  await frame();
-  const tc = performance.now();
-  const cpu = bruteForceKnn(Zm, M, 100, kCand);
-  const cpuMs = performance.now() - tc;
-
-  const tg = performance.now();
-  const gpu = await knnGPU(device, Zm, M, 100, kCand, status);
-  const gpuMs = performance.now() - tg;
-
+function compareKnn(
+  oracle: { idx: Uint32Array; d2: Float32Array },
+  got: { idx: Uint32Array; d2: Float32Array },
+  M: number,
+  kCand: number
+): KnnAgreement {
   let recallHits = 0;
   let exact = 0;
   let maxRel = 0;
@@ -702,28 +703,88 @@ async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
   for (let i = 0; i < M; i++) {
     const base = i * kCand;
     seen.clear();
-    for (let k = 0; k < kCand; k++) seen.add(gpu.idx[base + k]);
+    for (let k = 0; k < kCand; k++) seen.add(got.idx[base + k]);
     for (let k = 0; k < kCand; k++) {
-      if (seen.has(cpu.idx[base + k])) recallHits++;
-      if (cpu.idx[base + k] === gpu.idx[base + k]) exact++;
+      if (seen.has(oracle.idx[base + k])) recallHits++;
+      if (oracle.idx[base + k] === got.idx[base + k]) exact++;
       // Both lists are sorted ascending, so comparing distances positionally
       // stays valid even where tied indices swapped.
-      const a = cpu.d2[base + k];
-      const rel = Math.abs(a - gpu.d2[base + k]) / Math.max(Math.abs(a), 1e-12);
+      const a = oracle.d2[base + k];
+      const rel = Math.abs(a - got.d2[base + k]) / Math.max(Math.abs(a), 1e-12);
       if (rel > maxRel) maxRel = rel;
     }
   }
-
   const tot = M * kCand;
-  const msg =
-    `kNN check · N=${M} k=${kCand} · ` +
-    `recall ${((recallHits / tot) * 100).toFixed(3)}% · ` +
-    `exact order ${((exact / tot) * 100).toFixed(1)}% · ` +
-    `max rel Δd² ${maxRel.toExponential(1)} · ` +
-    `CPU ${cpuMs | 0}ms vs GPU ${gpuMs | 0}ms ` +
-    `(${(cpuMs / Math.max(gpuMs, 1)).toFixed(1)}×)`;
-  console.log(msg);
-  status(msg);
+  return { recall: recallHits / tot, exactOrder: exact / tot, maxRel };
+}
+
+/**
+ * Runs every kNN backend over one identical input and reports how they compare.
+ *
+ * `bruteForceKnn` is the oracle — it defines what the right answer is, so it is
+ * run once and everything else is scored against it. That makes this both the
+ * regression guard on the exact GPU kernel and the recall measurement for the
+ * approximate one, which are otherwise two different questions.
+ */
+async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
+  // Capped: the CPU reference is O(N^2*D), so checking at full 65k would take
+  // ~40 minutes. A prefix is a perfectly valid comparison — every backend sees
+  // the identical input.
+  const M = Math.min(N, 2000);
+  const kCand = Math.min(60, M - 1);
+  const Zm = Z.subarray(0, M * 100);
+
+  status(`kNN self-check at ${M} points: CPU oracle…`);
+  await frame();
+  const tc = performance.now();
+  const oracle = bruteForceKnn(Zm, M, 100, kCand);
+  const cpuMs = performance.now() - tc;
+
+  const contenders: [string, () => Promise<{ idx: Uint32Array; d2: Float32Array }>][] =
+    [
+      ["brute force (GPU)", () => knnGPU(device, Zm, M, 100, kCand, status)],
+      [
+        "NN-Descent (GPU)",
+        () =>
+          nndescentGPU(device, Zm, M, 100, kCand, {
+            seed: params.seed,
+            onStatus: status,
+          }),
+      ],
+    ];
+
+  const lines = [
+    `kNN check · N=${M} k=${kCand}`,
+    `  brute force (CPU)   oracle` +
+      `                                        ${(cpuMs | 0)
+        .toString()
+        .padStart(7)}ms`,
+  ];
+  const brief: string[] = [];
+
+  for (const [name, run] of contenders) {
+    status(`kNN self-check at ${M} points: ${name}…`);
+    await frame();
+    const t = performance.now();
+    const got = await run();
+    const ms = performance.now() - t;
+    const a = compareKnn(oracle, got, M, kCand);
+
+    lines.push(
+      `  ${name.padEnd(20)}` +
+        `recall ${(a.recall * 100).toFixed(3).padStart(7)}%  ` +
+        `exact ${(a.exactOrder * 100).toFixed(1).padStart(5)}%  ` +
+        `max rel Δd² ${a.maxRel.toExponential(1)}  ` +
+        `${(ms | 0).toString().padStart(7)}ms  ` +
+        `${(cpuMs / Math.max(ms, 1)).toFixed(1)}× vs CPU`
+    );
+    brief.push(
+      `${name} ${(a.recall * 100).toFixed(2)}% / ${ms | 0}ms`
+    );
+  }
+
+  console.log(lines.join("\n"));
+  status(`kNN check · N=${M} k=${kCand} · CPU ${cpuMs | 0}ms · ${brief.join(" · ")} · full table in console`);
   await new Promise((r) => setTimeout(r, 4000));
 }
 
