@@ -29,6 +29,14 @@ export interface PacmapOptions {
   /** Adam learning rate. Default 1.0 */
   lr?: number;
   seed?: number;
+  /**
+   * Where to build the kNN graph. Default "gpu". "cpu" keeps the O(N^2*D)
+   * reference path, which is only tolerable below a few thousand points but is
+   * useful as a correctness oracle.
+   */
+  knn?: "gpu" | "cpu";
+  /** Progress callback for the setup phase. */
+  onStatus?: (msg: string) => void;
 }
 
 const ADAM_B1 = 0.9;
@@ -56,17 +64,42 @@ function mulberry32(seed: number): () => number {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force kNN (CPU)
+// Buffer helper
+// ---------------------------------------------------------------------------
+
+function mkBuf(
+  device: GPUDevice,
+  arr: ArrayBufferView,
+  usage: GPUBufferUsageFlags
+): GPUBuffer {
+  const b = device.createBuffer({
+    size: Math.max(arr.byteLength, 4),
+    usage,
+    mappedAtCreation: true,
+  });
+  new Uint8Array(b.getMappedRange()).set(
+    new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength)
+  );
+  b.unmap();
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Brute-force kNN (CPU) — reference implementation
 // ---------------------------------------------------------------------------
 
 /**
  * Returns the kCand nearest neighbors of every point by squared euclidean
  * distance. O(N^2 * D) with a bounded insertion sort per row.
  *
- * [This is the piece to replace first if you outgrow it: either a tiled WGSL
- *  distance kernel with a per-thread bounded heap, or NN-Descent above ~20k.]
+ * Superseded by `knnGPU` for anything but small N — this is ~40 minutes at 65k,
+ * on whatever thread you call it from. Kept as the correctness oracle for the
+ * GPU path (see the `?knncheck=1` mode in the demo) and as an escape hatch.
+ *
+ * [NN-Descent would beat both above ~100k, where O(N^2) stops being viable even
+ *  at GPU throughput.]
  */
-function bruteForceKnn(
+export function bruteForceKnn(
   X: Float32Array,
   N: number,
   D: number,
@@ -116,6 +149,215 @@ function bruteForceKnn(
   return { idx, d2 };
 }
 
+// ---------------------------------------------------------------------------
+// Brute-force kNN (GPU)
+// ---------------------------------------------------------------------------
+
+const KNN_WG = 64;
+
+function knnShaderSource(N: number, D: number, K: number): string {
+  return /* wgsl */ `
+struct KParams { range : vec4<u32> };   // qStart, qEnd, _, _
+
+@group(0) @binding(0) var<storage, read>       X    : array<f32>;
+@group(0) @binding(1) var<storage, read_write> OutI : array<u32>;
+@group(0) @binding(2) var<storage, read_write> OutD : array<f32>;
+@group(0) @binding(3) var<uniform>             P    : KParams;
+
+const N : u32 = ${N}u;
+const D : u32 = ${D}u;
+const K : u32 = ${K}u;
+
+// One thread per query point, scanning every candidate and keeping a bounded
+// sorted list. Output matches bruteForceKnn exactly in shape and ordering.
+//
+// There is deliberately no cooperative shared-memory tile. A tile of ${KNN_WG}
+// candidates x ${D} dims is ${KNN_WG * D * 4} bytes, over the 16KB
+// maxComputeWorkgroupStorageSize limit, and tiling by dimension instead would
+// force every thread to hold one partial sum per tile candidate — moving the
+// pressure rather than relieving it. So the query row goes in a private array
+// and candidate rows are read straight from global memory: all ${KNN_WG}
+// threads in the workgroup hit the same candidate address at the same time,
+// which caches and broadcasts well.
+//
+// Also unlike the CPU reference, there is no early exit inside the distance
+// loop. It would be divergent, and every thread waits for the slowest anyway,
+// so the full distance is always computed and only the insert is branched on.
+// Inserts are rare (~K + K*ln(N/K) per query, well under 1% of the work), which
+// is what makes the insertion sort free in practice.
+@compute @workgroup_size(${KNN_WG})
+fn knn_main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = P.range.x + gid.x;
+  if (i >= P.range.y) { return; }
+
+  var q : array<f32, ${D}>;
+  let oi = i * D;
+  for (var k : u32 = 0u; k < D; k = k + 1u) { q[k] = X[oi + k]; }
+
+  var hD : array<f32, ${K}>;
+  var hI : array<u32, ${K}>;
+  var count : u32 = 0u;
+  var worst : f32 = 0.0;   // only read once count == K
+
+  for (var j : u32 = 0u; j < N; j = j + 1u) {
+    if (j == i) { continue; }
+
+    var s : f32 = 0.0;
+    let oj = j * D;
+    for (var k : u32 = 0u; k < D; k = k + 1u) {
+      let diff = q[k] - X[oj + k];
+      s = s + diff * diff;
+    }
+
+    if (count == K && s >= worst) { continue; }
+
+    // Shift the sorted list down one slot and drop s into place.
+    var pos : u32 = select(count, K - 1u, count == K);
+    loop {
+      if (pos == 0u) { break; }
+      if (hD[pos - 1u] <= s) { break; }
+      hD[pos] = hD[pos - 1u];
+      hI[pos] = hI[pos - 1u];
+      pos = pos - 1u;
+    }
+    hD[pos] = s;
+    hI[pos] = j;
+    if (count < K) { count = count + 1u; }
+    worst = hD[count - 1u];
+  }
+
+  let base = i * K;
+  for (var k : u32 = 0u; k < K; k = k + 1u) {
+    OutD[base + k] = hD[k];
+    OutI[base + k] = hI[k];
+  }
+}
+`;
+}
+
+/**
+ * GPU equivalent of `bruteForceKnn`. Same O(N^2 * D) work, same output shape and
+ * ordering (N x kCand row-major, ascending by squared distance), several orders
+ * of magnitude more throughput.
+ *
+ * Results are not bit-identical to the CPU path: JS accumulates distances in
+ * f64 and WGSL in f32, so near-ties can swap order. Recall is what matters and
+ * it should be ~1.0 — see the demo's `?knncheck=1` mode.
+ */
+export async function knnGPU(
+  device: GPUDevice,
+  X: Float32Array,
+  N: number,
+  D: number,
+  kCand: number,
+  onStatus: (msg: string) => void = () => {}
+): Promise<{ idx: Uint32Array; d2: Float32Array }> {
+  if (kCand < 1) throw new Error("kCand must be >= 1");
+  if (kCand > N - 1) throw new Error("kCand must be <= N-1");
+
+  const S = GPUBufferUsage.STORAGE;
+  const outBytes = N * kCand * 4;
+  const xBuf = mkBuf(device, X, S);
+  const idxBuf = device.createBuffer({
+    size: outBytes,
+    usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const d2Buf = device.createBuffer({
+    size: outBytes,
+    usage: S | GPUBufferUsage.COPY_SRC,
+  });
+  const pBuf = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const pipe = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      module: device.createShaderModule({
+        code: knnShaderSource(N, D, kCand),
+      }),
+      entryPoint: "knn_main",
+    },
+  });
+  const bg = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: xBuf } },
+      { binding: 1, resource: { buffer: idxBuf } },
+      { binding: 2, resource: { buffer: d2Buf } },
+      { binding: 3, resource: { buffer: pBuf } },
+    ],
+  });
+
+  // Dispatch in query-range chunks. This is required, not an optimization: one
+  // dispatch covering all N*N*D work runs for seconds at scale and trips the OS
+  // GPU watchdog (~2s on Windows), which loses the device. Each query is fully
+  // resolved inside a single dispatch — it scans every candidate — so chunks
+  // carry no state between them.
+  //
+  // The first chunk is deliberately tiny, then size is steered toward TARGET_MS:
+  // fast GPUs converge on large well-utilized dispatches, slow ones stay under
+  // the watchdog. Awaiting onSubmittedWorkDone is also the yield point that
+  // keeps the host responsive (this library stays DOM-free, so no rAF here).
+  const TARGET_MS = 40;
+  const range = new Uint32Array(4);
+  let chunk = Math.max(KNN_WG, Math.min(N, Math.ceil(2e8 / (N * D))));
+  let q = 0;
+  const t0 = performance.now();
+
+  while (q < N) {
+    const end = Math.min(q + chunk, N);
+    range[0] = q;
+    range[1] = end;
+    device.queue.writeBuffer(pBuf, 0, range);
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.ceil((end - q) / KNN_WG));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+
+    const t = performance.now();
+    await device.queue.onSubmittedWorkDone();
+    const dt = Math.max(performance.now() - t, 0.1);
+
+    q = end;
+    const scale = Math.min(4, Math.max(0.25, TARGET_MS / dt));
+    chunk = Math.max(KNN_WG, Math.min(N, Math.round(chunk * scale)));
+
+    const pct = ((q / N) * 100) | 0;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    onStatus(`Building kNN graph on GPU… ${pct}% (${q}/${N}, ${secs}s)`);
+  }
+
+  // --- Readback ----------------------------------------------------------
+  const stageI = device.createBuffer({
+    size: outBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const stageD = device.createBuffer({
+    size: outBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(idxBuf, 0, stageI, 0, outBytes);
+  enc.copyBufferToBuffer(d2Buf, 0, stageD, 0, outBytes);
+  device.queue.submit([enc.finish()]);
+
+  await stageI.mapAsync(GPUMapMode.READ);
+  await stageD.mapAsync(GPUMapMode.READ);
+  const idx = new Uint32Array(stageI.getMappedRange().slice(0));
+  const d2 = new Float32Array(stageD.getMappedRange().slice(0));
+  stageI.unmap();
+  stageD.unmap();
+
+  for (const b of [xBuf, idxBuf, d2Buf, pBuf, stageI, stageD]) b.destroy();
+  return { idx, d2 };
+}
+
 function dist2(X: Float32Array, D: number, a: number, b: number): number {
   let s = 0;
   const oa = a * D;
@@ -137,6 +379,15 @@ interface Pairs {
   t: Uint8Array;
 }
 
+/** Candidate pool size the kNN stage must produce for `samplePairs`. */
+function candidateCount(N: number, nNB: number): number {
+  return Math.min(nNB + 50, N - 1);
+}
+
+/**
+ * Takes the kNN result rather than computing it, so this stays synchronous
+ * while the graph itself is built on the GPU (an async step).
+ */
 function samplePairs(
   X: Float32Array,
   N: number,
@@ -144,10 +395,11 @@ function samplePairs(
   nNB: number,
   nMN: number,
   nFP: number,
-  rand: () => number
+  rand: () => number,
+  knn: { idx: Uint32Array; d2: Float32Array },
+  kCand: number
 ): Pairs {
-  const kCand = Math.min(nNB + 50, N - 1);
-  const { idx, d2 } = bruteForceKnn(X, N, D, kCand);
+  const { idx, d2 } = knn;
 
   // sigma_i = mean euclidean distance to the 4th-6th nearest neighbor.
   const sig = new Float32Array(N);
@@ -407,11 +659,19 @@ export async function pacmapWebGPU(
   const lr = opts.lr ?? 1.0;
   const totalIters = n1 + n2 + n3;
   const rand = mulberry32(opts.seed ?? 42);
+  const onStatus = opts.onStatus ?? (() => {});
 
-  // --- CPU setup ---------------------------------------------------------
+  // --- Setup -------------------------------------------------------------
   // [X is used as given. The reference applies PCA to 100 dims first when
   //  D > 100; add that here if your input is high-dimensional.]
-  const pairs = samplePairs(X, N, D, nNB, nMN, nFP, rand);
+  const kCand = candidateCount(N, nNB);
+  const knn =
+    opts.knn === "cpu"
+      ? bruteForceKnn(X, N, D, kCand)
+      : await knnGPU(device, X, N, D, kCand, onStatus);
+
+  onStatus("Sampling pairs…");
+  const pairs = samplePairs(X, N, D, nNB, nMN, nFP, rand, knn, kCand);
   const { offsets, data } = buildCSR(N, pairs);
 
   // [Reference default init is scaled PCA. Gaussian is used here for brevity;
@@ -424,18 +684,8 @@ export async function pacmapWebGPU(
   }
 
   // --- Buffers -----------------------------------------------------------
-  const mk = (arr: ArrayBufferView, usage: GPUBufferUsageFlags) => {
-    const b = device.createBuffer({
-      size: Math.max(arr.byteLength, 4),
-      usage,
-      mappedAtCreation: true,
-    });
-    new Uint8Array(b.getMappedRange()).set(
-      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength)
-    );
-    b.unmap();
-    return b;
-  };
+  const mk = (arr: ArrayBufferView, usage: GPUBufferUsageFlags) =>
+    mkBuf(device, arr, usage);
 
   const S = GPUBufferUsage.STORAGE;
   const yBuf = mk(Y0, S | GPUBufferUsage.COPY_SRC | GPUBufferUsage.VERTEX);

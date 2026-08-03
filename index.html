@@ -25,6 +25,13 @@
   button:disabled { opacity: .45; cursor: default; }
   .stat { color: #878d99; }
   .stat b { color: #d7dae0; font-weight: 600; }
+  input[type="range"] {
+    vertical-align: middle; width: 150px; accent-color: #5a9ce6;
+    background: transparent; cursor: pointer;
+  }
+  input[type="range"]:disabled { opacity: .45; cursor: default; }
+  output { display: inline-block; min-width: 4.5em; text-align: right; }
+  .hint { color: #6b7280; }
   #view { flex: 1; width: 100%; display: block; min-height: 0; }
   footer { padding: 8px 14px; border-top: 1px solid #23262e; display: flex;
            gap: 14px; align-items: center; flex-wrap: wrap; }
@@ -41,12 +48,9 @@
   <header>
     <h1>PaCMAP · WebGPU · MNIST</h1>
     <label>points
-      <select id="samples">
-        <option value="1000">1,000</option>
-        <option value="3000" selected>3,000</option>
-        <option value="5000">5,000</option>
-        <option value="10000">10,000 (slow setup)</option>
-      </select>
+      <input type="range" id="samples" min="1000" max="65000" step="1000" value="3000" />
+      <output id="samplesOut">3,000</output>
+      <span class="hint" id="samplesHint"></span>
     </label>
     <label>iters/frame
       <select id="speed">

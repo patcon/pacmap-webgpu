@@ -1,5 +1,10 @@
-import { pacmapWebGPU, type PacmapRun } from "./pacmap-webgpu";
-import { loadMnist, IMAGE_SIZE } from "./mnist";
+import {
+  pacmapWebGPU,
+  bruteForceKnn,
+  knnGPU,
+  type PacmapRun,
+} from "./pacmap-webgpu";
+import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
 
 // ---------------------------------------------------------------------------
@@ -11,10 +16,22 @@ const statusEl = document.getElementById("status") as HTMLElement;
 const iterEl = document.getElementById("iter") as HTMLElement;
 const phaseEl = document.getElementById("phase") as HTMLElement;
 const startBtn = document.getElementById("start") as HTMLButtonElement;
-const sampleSel = document.getElementById("samples") as HTMLSelectElement;
+const sampleSel = document.getElementById("samples") as HTMLInputElement;
+const sampleOut = document.getElementById("samplesOut") as HTMLOutputElement;
+const sampleHint = document.getElementById("samplesHint") as HTMLElement;
 const speedSel = document.getElementById("speed") as HTMLSelectElement;
 
 const status = (m: string) => (statusEl.textContent = m);
+
+// ---------------------------------------------------------------------------
+// URL switches
+//   ?knn=cpu      use the O(N^2*D) CPU reference instead of the GPU kernel
+//   ?knncheck=1   run both and report how closely they agree
+// ---------------------------------------------------------------------------
+
+const qs = new URLSearchParams(location.search);
+const KNN_MODE = qs.get("knn") === "cpu" ? "cpu" : "gpu";
+const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Colors for digits 0-9. Distinct hues, roughly matched in luminance so no one
 // class dominates visually.
@@ -145,6 +162,7 @@ async function go() {
 
     const N = parseInt(sampleSel.value, 10);
     const stepsPerFrame = parseInt(speedSel.value, 10);
+    sampleSel.disabled = true;
 
     // --- Data --------------------------------------------------------------
     const { X, labels } = await loadMnist(N, status);
@@ -152,13 +170,24 @@ async function go() {
     status("Projecting 784d → 100d (randomized PCA)…");
     await frame();
     const t0 = performance.now();
-    const Z = pcaProject(X, N, IMAGE_SIZE, 100);
+    // inPlace is safe here: X is never read again after this call, and it saves
+    // a second n*784 f32 array — 204MB at 65k.
+    const Z = await pcaProject(X, N, IMAGE_SIZE, 100, {
+      inPlace: true,
+      onStatus: status,
+    });
     const tPca = performance.now() - t0;
+
+    if (KNN_CHECK) await knnSelfCheck(device, Z, N);
 
     status(`PCA ${tPca | 0}ms · building kNN graph + sampling pairs…`);
     await frame();
     const t1 = performance.now();
-    const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, { seed: 7 });
+    const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
+      seed: 7,
+      knn: KNN_MODE,
+      onStatus: status,
+    });
     const tSetup = performance.now() - t1;
 
     // --- Render resources --------------------------------------------------
@@ -340,12 +369,100 @@ async function go() {
   } finally {
     running = false;
     startBtn.disabled = false;
+    sampleSel.disabled = false;
   }
 }
 
 function frame(): Promise<void> {
   return new Promise((r) => requestAnimationFrame(() => r()));
 }
+
+// ---------------------------------------------------------------------------
+// kNN self-check (?knncheck=1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs the CPU reference and the GPU kernel over the same input and reports how
+ * closely they agree.
+ *
+ * They will not agree bit-for-bit — JS accumulates distances in f64, WGSL in
+ * f32 — so near-ties legitimately swap order and comparing index arrays for
+ * equality would cry wolf. Recall is the metric that would actually catch a
+ * broken kernel; exact-order agreement is reported only as colour.
+ */
+async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
+  // Capped: the CPU reference is O(N^2*D), so checking at full 65k would take
+  // ~40 minutes. A prefix is a perfectly valid comparison — both paths see the
+  // identical input.
+  const M = Math.min(N, 2000);
+  const kCand = Math.min(60, M - 1);
+  const Zm = Z.subarray(0, M * 100);
+
+  status(`kNN self-check at ${M} points: CPU reference…`);
+  await frame();
+  const tc = performance.now();
+  const cpu = bruteForceKnn(Zm, M, 100, kCand);
+  const cpuMs = performance.now() - tc;
+
+  const tg = performance.now();
+  const gpu = await knnGPU(device, Zm, M, 100, kCand, status);
+  const gpuMs = performance.now() - tg;
+
+  let recallHits = 0;
+  let exact = 0;
+  let maxRel = 0;
+  const seen = new Set<number>();
+  for (let i = 0; i < M; i++) {
+    const base = i * kCand;
+    seen.clear();
+    for (let k = 0; k < kCand; k++) seen.add(gpu.idx[base + k]);
+    for (let k = 0; k < kCand; k++) {
+      if (seen.has(cpu.idx[base + k])) recallHits++;
+      if (cpu.idx[base + k] === gpu.idx[base + k]) exact++;
+      // Both lists are sorted ascending, so comparing distances positionally
+      // stays valid even where tied indices swapped.
+      const a = cpu.d2[base + k];
+      const rel = Math.abs(a - gpu.d2[base + k]) / Math.max(Math.abs(a), 1e-12);
+      if (rel > maxRel) maxRel = rel;
+    }
+  }
+
+  const tot = M * kCand;
+  const msg =
+    `kNN check · N=${M} k=${kCand} · ` +
+    `recall ${((recallHits / tot) * 100).toFixed(3)}% · ` +
+    `exact order ${((exact / tot) * 100).toFixed(1)}% · ` +
+    `max rel Δd² ${maxRel.toExponential(1)} · ` +
+    `CPU ${cpuMs | 0}ms vs GPU ${gpuMs | 0}ms ` +
+    `(${(cpuMs / Math.max(gpuMs, 1)).toFixed(1)}×)`;
+  console.log(msg);
+  status(msg);
+  await new Promise((r) => setTimeout(r, 4000));
+}
+
+// ---------------------------------------------------------------------------
+// Sample-count slider
+// ---------------------------------------------------------------------------
+
+/**
+ * Very rough setup-time estimate, so the cost of the high end is visible before
+ * committing to a run. PCA dominates (~4*n*784*100 MACs of plain JS); the GPU
+ * kNN term is small but quadratic, so it only starts to show past ~40k.
+ */
+function estimateSetupSecs(n: number): number {
+  return (n * 784 * 100 * 4) / 5e8 + (n * n * 100) / 3e11 + n * 4e-5;
+}
+
+sampleSel.max = String(NUM_AVAILABLE);
+
+function updateSampleLabel() {
+  const n = parseInt(sampleSel.value, 10);
+  sampleOut.value = n.toLocaleString();
+  const s = estimateSetupSecs(n);
+  sampleHint.textContent = `~${s < 10 ? s.toFixed(1) : Math.round(s)}s setup`;
+}
+sampleSel.addEventListener("input", updateSampleLabel);
+updateSampleLabel();
 
 // Legend
 const legend = document.getElementById("legend")!;
