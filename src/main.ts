@@ -576,7 +576,7 @@ viewFolder
   .addBinding(view, "pointSize", {
     label: "point size",
     min: 0.2,
-    max: 8,
+    max: 2,
     step: 0.1,
   })
   .on("change", () => onViewChange?.());
