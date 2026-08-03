@@ -31,7 +31,7 @@ const status = (m: string) => (statusEl.textContent = m);
 
 // ---------------------------------------------------------------------------
 // URL switches
-//   ?knn=cpu|nnd  pick the kNN backend (default gpu brute force)
+//   ?knn=gpu|nnd  pick the kNN backend (default cpu brute force)
 //   ?knncheck=1   run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
@@ -39,9 +39,9 @@ type KnnMode = "gpu" | "cpu" | "nndescent";
 
 const qs = new URLSearchParams(location.search);
 const KNN_MODE: KnnMode =
-  qs.get("knn") === "cpu" ? "cpu"
+  qs.get("knn") === "gpu" ? "gpu"
   : qs.get("knn") === "nnd" || qs.get("knn") === "nndescent" ? "nndescent"
-  : "gpu";
+  : "cpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
@@ -583,16 +583,16 @@ viewFolder
 
 const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
 
-// Exact vs approximate is the interesting axis here, so both GPU backends sit
-// at the top. The CPU entry is the oracle, not a practical choice: it is
-// O(N^2*D) in plain JS, ~40 minutes at 65k, so it belongs last and is labelled
-// as the reference it is.
+// Ordered by how much the backend takes on trust: the CPU oracle first as the
+// default, then the exact GPU kernel, then the approximate one. It is O(N^2*D)
+// in plain JS — ~40 minutes at 65k — so the entry stays labelled as slow even
+// though it leads.
 pacmapFolder.addBinding(params, "knnMethod", {
-  label: "kNN",
+  label: "kNN algo",
   options: {
+    [`${KNN_LABELS.cpu} · slow`]: "cpu",
     [KNN_LABELS.gpu]: "gpu",
     [KNN_LABELS.nndescent]: "nndescent",
-    [`${KNN_LABELS.cpu} · slow`]: "cpu",
   },
 });
 

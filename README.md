@@ -16,7 +16,7 @@ Safari 26). Check `navigator.gpu` in the console if the page reports no adapter.
 |---|---|---|
 | MNIST decode | CPU | TF.js sprite PNG, chunked through a canvas |
 | PCA 784 → 100 | CPU | randomized range finder, `src/pca.ts` — the setup bottleneck |
-| kNN | **GPU** | brute force by default, one thread per query, `knnGPU`; NN-Descent and a CPU reference also selectable |
+| kNN | CPU by default | the exact `bruteForceKnn` reference; a GPU brute-force kernel (`knnGPU`) and GPU NN-Descent are both selectable |
 | Sigma scaling + pair sampling | CPU | near / mid-near / further, CSR build |
 | 450 optimizer iterations | **GPU** | gradient + Adam, no host round-trip |
 | Bounds / autoscale | **GPU** | single-workgroup reduce |
@@ -34,21 +34,22 @@ Optimization has never been the bottleneck — all 450 iterations finish well
 under a second at every size the slider offers. Setup is the whole cost, and the
 slider shows a rough estimate of it before you commit to a run.
 
-kNN used to dominate that: O(N²·D) on the CPU is ~60s at 10k and roughly 40
-minutes at 65k. It now runs as a WGSL kernel, one thread per query with a
-bounded insertion sort in registers, which is what makes the top of the slider
-reachable at all. What's left is the CPU PCA — ~4·n·d·k MACs of plain JS, tens
-of seconds at 65k. Porting those matmuls to WGSL is the next real win.
+kNN dominates that on the default backend: O(N²·D) on the CPU is ~60s at 10k and
+roughly 40 minutes at 65k. Switching the `kNN algo` dropdown to the GPU kernel — one
+thread per query with a bounded insertion sort in registers — is what makes the
+top of the slider reachable at all. Behind it sits the CPU PCA — ~4·n·d·k MACs
+of plain JS, tens of seconds at 65k. Porting those matmuls to WGSL is the next
+real win.
 
 ## Three kNN backends
 
-Pick one from the `kNN` dropdown in the pane, or with `?knn=`:
+Pick one from the `kNN algo` dropdown in the pane, or with `?knn=`:
 
 | Backend | | Notes |
 |---|---|---|
-| brute force (GPU) | `?knn=gpu` | default; exact, one thread per query |
+| brute force (CPU) | `?knn=cpu` | default; exact, the oracle — but ~40 minutes at 65k |
+| brute force (GPU) | `?knn=gpu` | exact, one thread per query |
 | NN-Descent (GPU) | `?knn=nnd` | approximate, ~99.9% recall |
-| brute force (CPU) | `?knn=cpu` | exact; the oracle, ~40 minutes at 65k |
 
 **NN-Descent is slower than brute force here, and that is the honest result.**
 Past ~100k points O(N²) stops being viable at any throughput and NN-Descent is
