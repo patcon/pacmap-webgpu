@@ -764,7 +764,7 @@ async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
   status(`kNN self-check at ${M} points: CPU oracle…`);
   await frame();
   const tc = performance.now();
-  const oracle = bruteForceKnn(Zm, M, 100, kCand);
+  const oracle = await bruteForceKnn(Zm, M, 100, kCand, status);
   const cpuMs = performance.now() - tc;
 
   const contenders: [string, () => Promise<{ idx: Uint32Array; d2: Float32Array }>][] =

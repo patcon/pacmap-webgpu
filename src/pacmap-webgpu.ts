@@ -102,6 +102,29 @@ function mkBuf(
 }
 
 // ---------------------------------------------------------------------------
+// Cooperative yielding
+//
+// Same mechanism as `pca.ts`, duplicated rather than imported so this file
+// stays standalone (`mulberry32` is duplicated for the same reason). Not
+// setTimeout(0): that clamps to ~4ms once nested. A MessageChannel task has no
+// clamp and still lets the browser paint between slices. Guarded so the library
+// still runs headlessly under Node.
+// ---------------------------------------------------------------------------
+
+/** Target time between yields. Long enough to amortize, short enough to feel live. */
+const SLICE_MS = 25;
+
+const chan = typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+
+function tick(): Promise<void> {
+  if (!chan) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    chan.port1.onmessage = () => resolve();
+    chan.port2.postMessage(0);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Brute-force kNN (CPU) — reference implementation
 // ---------------------------------------------------------------------------
 
@@ -115,18 +138,33 @@ function mkBuf(
  *
  * Above ~100k, where O(N^2) stops being viable even at GPU throughput, neither
  * brute-force path is usable and `nndescentGPU` is the one that still scales.
+ *
+ * Async purely so it can yield: at 65k this runs for tens of minutes, and a
+ * synchronous version pins the event loop for the whole of it, so the caller's
+ * `onStatus` fires into a page that can never repaint. The arithmetic is
+ * unchanged and the yields cost well under 1% — one `tick` per ${SLICE_MS}ms
+ * slice — but note that a timing harness measuring this will see that overhead.
+ *
+ * Yielding keeps the page painting; it does not keep it *responsive*, since the
+ * main thread is still ~100% busy between slices. A worker would fix that, at
+ * the cost of making this file no longer standalone. Not worth it for a debug
+ * oracle — see the README.
  */
-export function bruteForceKnn(
+export async function bruteForceKnn(
   X: Float32Array,
   N: number,
   D: number,
-  kCand: number
-): { idx: Uint32Array; d2: Float32Array } {
+  kCand: number,
+  onStatus: (msg: string) => void = () => {}
+): Promise<{ idx: Uint32Array; d2: Float32Array }> {
   const idx = new Uint32Array(N * kCand);
   const d2 = new Float32Array(N * kCand);
 
   const heapI = new Uint32Array(kCand);
   const heapD = new Float32Array(kCand);
+
+  const t0 = performance.now();
+  let last = t0;
 
   for (let i = 0; i < N; i++) {
     let count = 0;
@@ -161,9 +199,35 @@ export function bruteForceKnn(
 
     idx.set(heapI.subarray(0, count), i * kCand);
     d2.set(heapD.subarray(0, count), i * kCand);
+
+    // The clock check is per-row rather than every Nth row (as pca.ts does)
+    // because one row here is N*D work — milliseconds at any interesting N — so
+    // the check is already lost in the noise, and striding it would make the
+    // yield rate depend on N.
+    const now = performance.now();
+    if (now - last >= SLICE_MS) {
+      const done = i + 1;
+      const elapsed = (now - t0) / 1000;
+      // Every row costs the same, so elapsed/done extrapolates honestly. Worth
+      // showing: this path runs for tens of minutes at the top of the slider.
+      const left = (elapsed / done) * (N - done);
+      onStatus(
+        `Building kNN graph on CPU… ${((done / N) * 100) | 0}% ` +
+          `(${done}/${N}, ${elapsed.toFixed(1)}s, ~${fmtDuration(left)} left)`
+      );
+      await tick();
+      last = performance.now();
+    }
   }
 
   return { idx, d2 };
+}
+
+/** Compact "left" figure — seconds under a minute, then minutes, then hours. */
+function fmtDuration(secs: number): string {
+  if (secs < 60) return `${Math.ceil(secs)}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}min`;
+  return `${(secs / 3600).toFixed(1)}h`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,7 +1223,7 @@ export async function pacmapWebGPU(
   const kCand = candidateCount(N, nNB);
   const knn =
     opts.knn === "cpu"
-      ? bruteForceKnn(X, N, D, kCand)
+      ? await bruteForceKnn(X, N, D, kCand, onStatus)
       : opts.knn === "nndescent"
         ? await nndescentGPU(device, X, N, D, kCand, {
             ...opts.nndescent,
