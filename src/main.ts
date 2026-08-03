@@ -204,12 +204,15 @@ async function go() {
 
     if (KNN_CHECK) await knnSelfCheck(device, Z, N);
 
-    status(`PCA ${tPca | 0}ms · building kNN graph + sampling pairs…`);
+    const knnLabel = KNN_LABELS[params.knnMethod];
+    status(
+      `PCA ${tPca | 0}ms · building kNN graph (${knnLabel}) + sampling pairs…`
+    );
     await frame();
     const t1 = performance.now();
     const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
       seed: params.seed,
-      knn: KNN_MODE,
+      knn: params.knnMethod,
       nNeighbors: params.autoNeighbors ? undefined : params.nNeighbors,
       mnRatio: params.mnRatio,
       fpRatio: params.fpRatio,
@@ -414,7 +417,8 @@ async function go() {
 
     // --- Animate -----------------------------------------------------------
     status(
-      `${N} points · PCA ${tPca | 0}ms · kNN+pairs ${tSetup | 0}ms · optimizing…`
+      `${N} points · PCA ${tPca | 0}ms · ` +
+        `kNN+pairs ${tSetup | 0}ms (${knnLabel}) · optimizing…`
     );
 
     // The transport stays put and inert during the run, tracking progress; the
@@ -448,7 +452,8 @@ async function go() {
 
     const mb = ((frameCount * frameBytes) / (1 << 20)).toFixed(0);
     status(
-      `${N} points · PCA ${tPca | 0}ms · kNN+pairs ${tSetup | 0}ms · ` +
+      `${N} points · PCA ${tPca | 0}ms · ` +
+        `kNN+pairs ${tSetup | 0}ms (${knnLabel}) · ` +
         `${pm.totalIters} iters in ${elapsed | 0}ms ` +
         `(${(elapsed / pm.totalIters).toFixed(2)}ms/iter, includes render + rAF) · ` +
         `${frameCount} frames banked on the GPU (${mb}MB` +
@@ -550,6 +555,15 @@ const params = {
   mnRatio: 0.5,
   fpRatio: 2.0,
   seed: 7,
+  // Seeded from ?knn= so the URL still works, but the dropdown owns it after
+  // that — comparing backends is the point, and that shouldn't need a reload.
+  knnMethod: KNN_MODE,
+};
+
+const KNN_LABELS: Record<KnnMode, string> = {
+  gpu: "brute force (GPU)",
+  nndescent: "NN-Descent (GPU)",
+  cpu: "brute force (CPU)",
 };
 
 const pane = new Pane({
@@ -568,6 +582,19 @@ viewFolder
   .on("change", () => onViewChange?.());
 
 const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
+
+// Exact vs approximate is the interesting axis here, so both GPU backends sit
+// at the top. The CPU entry is the oracle, not a practical choice: it is
+// O(N^2*D) in plain JS, ~40 minutes at 65k, so it belongs last and is labelled
+// as the reference it is.
+pacmapFolder.addBinding(params, "knnMethod", {
+  label: "kNN",
+  options: {
+    [KNN_LABELS.gpu]: "gpu",
+    [KNN_LABELS.nndescent]: "nndescent",
+    [`${KNN_LABELS.cpu} · slow`]: "cpu",
+  },
+});
 
 // Turning "auto neighbors" on hands n_neighbors to the library's log10-of-N
 // rule; the slider then mirrors the value that rule picks rather than leaving
