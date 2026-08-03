@@ -34,12 +34,13 @@ Optimization has never been the bottleneck — all 450 iterations finish well
 under a second at every size the slider offers. Setup is the whole cost, and the
 slider shows a rough estimate of it before you commit to a run.
 
-kNN dominates that on the default backend: O(N²·D) on the CPU is ~60s at 10k and
-roughly 40 minutes at 65k. Switching the `kNN algo` dropdown to the GPU kernel — one
-thread per query with a bounded insertion sort in registers — is what makes the
-top of the slider reachable at all. Behind it sits the CPU PCA — ~4·n·d·k MACs
-of plain JS, tens of seconds at 65k. Porting those matmuls to WGSL is the next
-real win.
+The bulk of it is the CPU PCA — ~4·n·d·k MACs of plain JS, tens of seconds at
+65k. Porting those matmuls to WGSL is the next real win.
+
+kNN is the other half, and which backend is fastest is not what the asymptotics
+predict — the CPU brute force measures fastest in practice, which is why it is
+the default. Don't reason about the three from their complexity; measure with
+`?knncheck=1`.
 
 ## Three kNN backends
 
@@ -47,7 +48,7 @@ Pick one from the `kNN algo` dropdown in the pane, or with `?knn=`:
 
 | Backend | | Notes |
 |---|---|---|
-| brute force (CPU) | `?knn=cpu` | default; exact, the oracle — but ~40 minutes at 65k |
+| brute force (CPU) | `?knn=cpu` | default; exact, the oracle, and the fastest here in practice |
 | brute force (GPU) | `?knn=gpu` | exact, one thread per query |
 | NN-Descent (GPU) | `?knn=nnd` | approximate, ~99.9% recall |
 

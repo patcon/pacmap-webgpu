@@ -584,13 +584,13 @@ viewFolder
 const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
 
 // Ordered by how much the backend takes on trust: the CPU oracle first as the
-// default, then the exact GPU kernel, then the approximate one. It is O(N^2*D)
-// in plain JS — ~40 minutes at 65k — so the entry stays labelled as slow even
-// though it leads.
+// default, then the exact GPU kernel, then the approximate one. No speed
+// annotation on any of them — measured, the ordering doesn't match what the
+// asymptotics suggest, so a label here would mislead.
 pacmapFolder.addBinding(params, "knnMethod", {
   label: "kNN algo",
   options: {
-    [`${KNN_LABELS.cpu} · slow`]: "cpu",
+    [KNN_LABELS.cpu]: "cpu",
     [KNN_LABELS.gpu]: "gpu",
     [KNN_LABELS.nndescent]: "nndescent",
   },
@@ -754,8 +754,8 @@ function compareKnn(
  * approximate one, which are otherwise two different questions.
  */
 async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
-  // Capped: the CPU reference is O(N^2*D), so checking at full 65k would take
-  // ~40 minutes. A prefix is a perfectly valid comparison — every backend sees
+  // Capped: this runs every backend serially and the check is meant to stay
+  // interactive. A prefix is a perfectly valid comparison — every backend sees
   // the identical input.
   const M = Math.min(N, 2000);
   const kCand = Math.min(60, M - 1);
