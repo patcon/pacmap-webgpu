@@ -2,6 +2,7 @@ import {
   pacmapWebGPU,
   bruteForceKnn,
   knnGPU,
+  defaultNeighbors,
   type PacmapRun,
 } from "./pacmap-webgpu";
 import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
@@ -21,7 +22,6 @@ const sampleSel = document.getElementById("samples") as HTMLInputElement;
 const sampleOut = document.getElementById("samplesOut") as HTMLOutputElement;
 const sampleHint = document.getElementById("samplesHint") as HTMLElement;
 const speedSel = document.getElementById("speed") as HTMLSelectElement;
-const transportEl = document.getElementById("transport") as HTMLElement;
 const playBtn = document.getElementById("play") as HTMLButtonElement;
 const scrub = document.getElementById("scrub") as HTMLInputElement;
 const readoutEl = document.getElementById("readout") as HTMLElement;
@@ -202,8 +202,9 @@ async function go() {
     await frame();
     const t1 = performance.now();
     const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
-      seed: 7,
+      seed: params.seed,
       knn: KNN_MODE,
+      nNeighbors: params.autoNeighbors ? undefined : params.nNeighbors,
       mnRatio: params.mnRatio,
       fpRatio: params.fpRatio,
       onStatus: status,
@@ -410,8 +411,9 @@ async function go() {
       `${N} points · PCA ${tPca | 0}ms · kNN+pairs ${tSetup | 0}ms · optimizing…`
     );
 
+    // The transport stays put and inert during the run, tracking progress; the
+    // playback block below is what hands the controls over.
     scrub.max = String(frameCount - 1);
-    transportEl.hidden = false;
 
     // Capture must happen on `stride` boundaries, so the loop steps in chunks
     // of `stride` and presents every `chunks` of them — that keeps the
@@ -533,7 +535,16 @@ let onViewChange: (() => void) | null = null;
  * already in flight. The folder is disabled while one is running and the values
  * are read at the top of the next `go()`.
  */
-const params = { mnRatio: 0.5, fpRatio: 2.0 };
+const params = {
+  // Off by default: upstream PaCMAP's signature default is a flat
+  // n_neighbors=10, and its log10 rule only fires when the caller explicitly
+  // passes None. This demo matches the signature default, not the rule.
+  autoNeighbors: false,
+  nNeighbors: 10,
+  mnRatio: 0.5,
+  fpRatio: 2.0,
+  seed: 7,
+};
 
 const pane = new Pane({
   container: document.getElementById("pane") as HTMLElement,
@@ -551,14 +562,38 @@ viewFolder
   .on("change", () => onViewChange?.());
 
 const pacmapFolder = pane.addFolder({ title: "pacmap · next run" });
-// Ranges bracket the reference defaults (0.5 / 2.0) generously enough to see
+
+// Turning "auto neighbors" on hands n_neighbors to the library's log10-of-N
+// rule; the slider then mirrors the value that rule picks rather than leaving
+// it implicit, and goes read-only because it is no longer the input.
+pacmapFolder
+  .addBinding(params, "autoNeighbors", { label: "auto neighbors" })
+  .on("change", (e) => {
+    nnBinding.disabled = e.value;
+    syncAutoNeighbors();
+  });
+const nnBinding = pacmapFolder.addBinding(params, "nNeighbors", {
+  label: "n_neighbors",
+  min: 3,
+  max: 60,
+  step: 1,
+});
+
+/** Keeps the displayed n_neighbors in step with the point-count slider. */
+function syncAutoNeighbors() {
+  if (!params.autoNeighbors) return;
+  params.nNeighbors = defaultNeighbors(parseInt(sampleSel.value, 10));
+  nnBinding.refresh();
+}
+
+// Ranges top out at 3x the reference defaults (0.5 / 2.0), enough travel to see
 // the structure change: dropping MN toward 0 loses global layout, raising FP
 // pushes clusters apart. 0 is a legal value for both — it just drops that pair
 // kind entirely.
 pacmapFolder.addBinding(params, "mnRatio", {
   label: "MN ratio",
   min: 0,
-  max: 3,
+  max: 1.5,
   step: 0.05,
 });
 pacmapFolder.addBinding(params, "fpRatio", {
@@ -567,6 +602,9 @@ pacmapFolder.addBinding(params, "fpRatio", {
   max: 6,
   step: 0.05,
 });
+// The seed drives pair sampling and the Gaussian init, so scrubbing it is how
+// you tell a stable structure from an artifact of one layout.
+pacmapFolder.addBinding(params, "seed", { min: 0, max: 999, step: 1 });
 
 // ---------------------------------------------------------------------------
 // Transport (play/pause + scrubber)
@@ -587,8 +625,9 @@ function setPlaying(on: boolean) {
   playBtn.textContent = on ? "❚❚" : "▶";
 }
 
+// The bar itself is never hidden — it holds its place in the layout and just
+// goes inert, so starting a run doesn't reflow the canvas out from under you.
 function resetTransport() {
-  transportEl.hidden = true;
   onSeek = null;
   onPlayToggle = null;
   setPlaying(false);
@@ -703,6 +742,7 @@ function updateSampleLabel() {
   sampleOut.value = n.toLocaleString();
   const s = estimateSetupSecs(n);
   sampleHint.textContent = `~${s < 10 ? s.toFixed(1) : Math.round(s)}s setup`;
+  syncAutoNeighbors();
 }
 sampleSel.addEventListener("input", updateSampleLabel);
 updateSampleLabel();

@@ -39,6 +39,15 @@ export interface PacmapOptions {
   onStatus?: (msg: string) => void;
 }
 
+/**
+ * The reference heuristic for `nNeighbors`: flat below 10k, then growing with
+ * log10(N). Exported so a caller offering an "auto" toggle can show the value
+ * it would get rather than duplicating the formula.
+ */
+export function defaultNeighbors(N: number): number {
+  return N <= 10000 ? 10 : Math.round(10 + 15 * (Math.log10(N) - 4));
+}
+
 const ADAM_B1 = 0.9;
 const ADAM_B2 = 0.999;
 const ADAM_EPS = 1e-7;
@@ -650,9 +659,7 @@ export async function pacmapWebGPU(
   D: number,
   opts: PacmapOptions = {}
 ): Promise<PacmapRun> {
-  const nNB =
-    opts.nNeighbors ??
-    (N <= 10000 ? 10 : Math.round(10 + 15 * (Math.log10(N) - 4)));
+  const nNB = opts.nNeighbors ?? defaultNeighbors(N);
   const nMN = Math.round(nNB * (opts.mnRatio ?? 0.5));
   const nFP = Math.round(nNB * (opts.fpRatio ?? 2.0));
   const [n1, n2, n3] = opts.phases ?? [100, 100, 250];

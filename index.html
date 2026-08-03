@@ -36,7 +36,12 @@
      Tweakpane's default fixed top-right, which would sit under the header. */
   #stage { flex: 1; min-height: 0; position: relative; }
   #view { width: 100%; height: 100%; display: block; }
-  #pane { position: absolute; top: 10px; right: 10px; width: 210px; }
+  /* Tweakpane's value column is a fixed 160px, so the label gets whatever is
+     left — at the old 210px that was ~30px and every label truncated. */
+  #pane {
+    position: absolute; top: 10px; right: 10px;
+    width: min(300px, 45vw); --tp-blade-value-width: 150px;
+  }
   footer { padding: 8px 14px; border-top: 1px solid #23262e; display: flex;
            gap: 14px; align-items: center; flex-wrap: wrap; }
   #legend { display: flex; gap: 5px; }
@@ -48,7 +53,6 @@
   #status { color: #878d99; }
   #transport { padding: 8px 14px; border-top: 1px solid #23262e; display: flex;
                gap: 12px; align-items: center; }
-  #transport[hidden] { display: none; }
   #play { width: 2.2em; text-align: center; }
   #scrub { flex: 1; width: auto; min-width: 0; }
   #readout { color: #878d99; font-variant-numeric: tabular-nums;
@@ -65,8 +69,8 @@
     </label>
     <label>iters/frame
       <select id="speed">
-        <option value="1">1</option>
-        <option value="3" selected>3</option>
+        <option value="1" selected>1</option>
+        <option value="3">3</option>
         <option value="10">10</option>
         <option value="450">all at once</option>
       </select>
@@ -79,7 +83,7 @@
     <canvas id="view"></canvas>
     <div id="pane"></div>
   </div>
-  <div id="transport" hidden>
+  <div id="transport">
     <button id="play" title="Play/pause (space)" disabled>▶</button>
     <input type="range" id="scrub" min="0" max="0" value="0" step="1" disabled />
     <span id="readout">—</span>

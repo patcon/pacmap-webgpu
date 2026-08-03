@@ -26,7 +26,9 @@ Pipeline, in order (`src/main.ts` `go()` wires it all):
 3. `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
 4. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, playback transport, Tweakpane view controls, DOM/status.
 
-The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `pacmap` (the MN/FP pair ratios) is setup-time: pairs are sampled and the CSR built before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight.
+The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `pacmap` (n_neighbors, MN/FP pair ratios, seed) is setup-time: pairs are sampled and the CSR built before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit.
+
+The transport bar is always present. It never hides — it goes inert (controls disabled, readout `—`) so a run doesn't reflow the canvas.
 
 Tweakpane (the only runtime dependency) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
 
@@ -52,6 +54,8 @@ Three design decisions carry most of the file:
 `PacmapRun.positions` is created with `VERTEX` usage and bound directly as a vertex buffer by the renderer — no `mapAsync`, no pipeline stall, so per-iteration animation costs nothing extra. `read()` exists but is only for host readback, not the render path. Same reason the bounds/autoscale reduce in `main.ts` is a single-workgroup GPU pass: the render loop must never read positions back.
 
 Known deviations from the reference PaCMAP, deliberate and documented at their sites: Gaussian init rather than PCA init (so layouts vary by `seed` — change it in the `pacmapWebGPU` call), and no PCA-to-100d inside the library (the demo does it upstream).
+
+One more, easy to miss: omitting `nNeighbors` falls back to `defaultNeighbors(N)`, the `10 + 15*(log10(N) - 4)` rule. Upstream that rule is opt-in — `PaCMAP.__init__` defaults `n_neighbors=10` and only consults the rule when the caller passes `None` explicitly — so the library's implicit default is *not* the reference's. The demo passes 10 unless "auto neighbors" is ticked.
 
 ### Performance shape
 
