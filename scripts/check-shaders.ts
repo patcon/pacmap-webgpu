@@ -56,7 +56,7 @@ const computeLayout = (
       visibility: GPUShaderStage.COMPUTE,
       buffer:
         type === "uniform-dynamic"
-          ? { type: "uniform" as const, hasDynamicOffset: true, minBindingSize: 32 }
+          ? { type: "uniform" as const, hasDynamicOffset: true, minBindingSize: 48 }
           : { type },
     })),
   });

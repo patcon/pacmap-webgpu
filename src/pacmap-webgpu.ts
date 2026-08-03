@@ -1,5 +1,5 @@
 /**
- * Minimal PaCMAP on WebGPU.
+ * Minimal PaCMAP — and LocalMAP — on WebGPU.
  *
  * Split of responsibilities:
  *   CPU (once, at setup)  - kNN, sigma scaling, pair sampling, CSR build
@@ -22,6 +22,23 @@
 // ---------------------------------------------------------------------------
 
 export interface PacmapOptions {
+  /**
+   * Which algorithm to run. Default "pacmap".
+   *
+   * "localmap" is LocalMAP (Wang et al., AAAI 2025), which upstream ships as a
+   * subclass of PaCMAP reusing its whole setup path — so it is a variant here
+   * rather than a separate entry point. It differs only inside phase 3, in two
+   * ways: the near-pair gradient picks up a `(lowDistThres/2)/|d|` factor (see
+   * `shaderSource`), and the further pairs are periodically redrawn against the
+   * *embedding* rather than staying fixed for the whole run.
+   */
+  variant?: "pacmap" | "localmap";
+  /**
+   * LocalMAP's `low_dist_thres`. Default 10, as upstream. Ignored under
+   * "pacmap". Sets both the near-pair coefficient (as `lowDistThres/2`) and the
+   * radius the redrawn further pairs are restricted to.
+   */
+  lowDistThres?: number;
   /** Nearest neighbors per point. Default follows the reference heuristic. */
   nNeighbors?: number;
   /** n_MN = round(nNeighbors * mnRatio). Default 0.5 */
@@ -1118,7 +1135,8 @@ function shaderSource(N: number): string {
   return /* wgsl */ `
 struct Params {
   w  : vec4<f32>,   // wNB, wMN, wFP, lr
-  bc : vec4<f32>,   // 1/(1-b1^t), 1/(1-b2^t), _, _
+  bc : vec4<f32>,   // 1/(1-b1^t), 1/(1-b2^t), nnA, nnB
+  it : vec4<f32>,   // iteration index, _, _, _
 };
 
 @group(0) @binding(0) var<storage, read_write> Y    : array<f32>;
@@ -1157,7 +1175,14 @@ fn grad_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var c : f32 = 0.0;
     if (kind == 0u) {          // near:      w * dd / (10 + dd)
       let r = 10.0 + dd;
-      c = P.w.x * 20.0 / (r * r);
+      // The trailing factor is what separates LocalMAP from PaCMAP. Upstream
+      // writes it as a branch — phase 3 calls a whole second gradient kernel
+      // that multiplies this coefficient by (low_dist_thres/2)/sqrt(d_ij) —
+      // but as an affine (nnA, nnB) pair it needs neither a branch nor a
+      // second entry point, and costs one FMA on the path that already runs.
+      //   PaCMAP, and LocalMAP up to n1+n2:  (1, 0)              -> unchanged
+      //   LocalMAP after n1+n2:              (0, lowDistThres/2)
+      c = P.w.x * 20.0 / (r * r) * (P.bc.z + P.bc.w * inverseSqrt(dd));
     } else if (kind == 1u) {   // mid-near:  w * dd / (10000 + dd)
       let r = 10000.0 + dd;
       c = P.w.y * 20000.0 / (r * r);
@@ -1224,6 +1249,8 @@ export async function pacmapWebGPU(
   const nFP = Math.round(nNB * (opts.fpRatio ?? 2.0));
   const [n1, n2, n3] = opts.phases ?? [100, 100, 250];
   const lr = opts.lr ?? 1.0;
+  const variant = opts.variant ?? "pacmap";
+  const lowDistThres = opts.lowDistThres ?? 10;
   const totalIters = n1 + n2 + n3;
   const rand = mulberry32(opts.seed ?? 42);
   const onStatus = opts.onStatus ?? (() => {});
@@ -1281,6 +1308,18 @@ export async function pacmapWebGPU(
     params[o + 3] = lr;
     params[o + 4] = 1 / (1 - Math.pow(ADAM_B1, it + 1));
     params[o + 5] = 1 / (1 - Math.pow(ADAM_B2, it + 1));
+    // (nnA, nnB) — see the near-pair branch in `shaderSource`. Note the strict
+    // `>`: upstream guards this with `itr > num_iters[0] + num_iters[1]`, so at
+    // the default phases the modified gradient starts at iteration 201, one
+    // step after phase 3 itself does.
+    const localNB = variant === "localmap" && it > n1 + n2;
+    params[o + 6] = localNB ? 0 : 1;
+    params[o + 7] = localNB ? lowDistThres / 2 : 0;
+    // Read only by the further-pair resample, which needs a per-iteration draw
+    // counter. It has to travel in this slot rather than a buffer written per
+    // resample: queue writes are ordered against the single submit(), so every
+    // resample encoded into one command buffer would see the last value.
+    params[o + 8] = it;
   }
   const paramBuf = mk(params, GPUBufferUsage.UNIFORM);
 
@@ -1307,7 +1346,7 @@ export async function pacmapWebGPU(
       {
         binding: 6,
         visibility: GPUShaderStage.COMPUTE,
-        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 32 },
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 48 },
       },
     ],
   });
@@ -1334,7 +1373,7 @@ export async function pacmapWebGPU(
       { binding: 3, resource: { buffer: gradBuf } },
       { binding: 4, resource: { buffer: mBuf } },
       { binding: 5, resource: { buffer: vBuf } },
-      { binding: 6, resource: { buffer: paramBuf, size: 32 } },
+      { binding: 6, resource: { buffer: paramBuf, size: 48 } },
     ],
   });
 
@@ -1384,6 +1423,21 @@ export async function pacmapWebGPU(
       }
     },
   };
+}
+
+/**
+ * LocalMAP, for callers who would rather name the algorithm than pass a flag.
+ * Exactly `pacmapWebGPU` with `variant: "localmap"` — upstream's `LocalMAP` is
+ * likewise a subclass that reuses `PaCMAP.fit` wholesale.
+ */
+export function localmapWebGPU(
+  device: GPUDevice,
+  X: Float32Array,
+  N: number,
+  D: number,
+  opts: Omit<PacmapOptions, "variant"> = {}
+): Promise<PacmapRun> {
+  return pacmapWebGPU(device, X, N, D, { ...opts, variant: "localmap" });
 }
 
 // ---------------------------------------------------------------------------

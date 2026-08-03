@@ -6,14 +6,16 @@ One commit per task, straight to `main`. Both gates after every task:
 
 ## Phase 1 — LocalMAP gradient, end to end
 
-- [ ] **1. `variant` option + modified NN coefficient** — S — deps: none
+- [x] **1. `variant` option + modified NN coefficient** — S — deps: none
       `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`
-      - [ ] `variant?: "pacmap" | "localmap"` and `lowDistThres?: number` (default 10) on `PacmapOptions`
-      - [ ] `localmapWebGPU()` wrapper exported
-      - [ ] params slot 32 → 48 bytes, carrying `(A, B)` and the iteration index; `minBindingSize` bumped in the layout *and* in `check-shaders.ts`
-      - [ ] `grad_main` near-pair coefficient becomes `w_NB * 20/(10+dd)² * (A + B*inverseSqrt(dd))`
-      - [ ] `(A,B) = (0, lowDistThres/2)` only for `it > n1+n2` under `localmap`; `(1,0)` everywhere else
-      - [ ] PaCMAP output unchanged from `main`
+      - [x] `variant?: "pacmap" | "localmap"` and `lowDistThres?: number` (default 10) on `PacmapOptions`
+      - [x] `localmapWebGPU()` wrapper exported
+      - [x] params slot 32 → 48 bytes, carrying `(A, B)` and the iteration index; `minBindingSize` bumped in the layout *and* in `check-shaders.ts`
+      - [x] `grad_main` near-pair coefficient becomes `w_NB * 20/(10+dd)² * (A + B*inverseSqrt(dd))`
+      - [x] `(A,B) = (0, lowDistThres/2)` only for `it > n1+n2` under `localmap`; `(1,0)` everywhere else
+      - [x] PaCMAP output unchanged from `main` — by construction: `(1,0)` makes the
+            trailing factor exactly `1.0 + 0.0*inverseSqrt(dd)`, and `dd >= 1` always,
+            so there is no NaN/Inf path and `x * 1.0` is exact in IEEE754
 
 - [ ] **2. Demo controls for the variant** — S — deps: 1
       `src/main.ts`
