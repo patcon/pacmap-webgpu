@@ -42,6 +42,13 @@
     font-weight: 700; font-size: 11px;
   }
   #status { color: #878d99; }
+  #transport { padding: 8px 14px; border-top: 1px solid #23262e; display: flex;
+               gap: 12px; align-items: center; }
+  #transport[hidden] { display: none; }
+  #play { width: 2.2em; text-align: center; }
+  #scrub { flex: 1; width: auto; min-width: 0; }
+  #readout { color: #878d99; font-variant-numeric: tabular-nums;
+             min-width: 13ch; text-align: right; }
 </style>
 </head>
 <body>
@@ -65,6 +72,11 @@
     <span class="stat">phase <b id="phase">—</b></span>
   </header>
   <canvas id="view"></canvas>
+  <div id="transport" hidden>
+    <button id="play" title="Play/pause (space)" disabled>▶</button>
+    <input type="range" id="scrub" min="0" max="0" value="0" step="1" disabled />
+    <span id="readout">—</span>
+  </div>
   <footer>
     <div id="legend"></div>
     <span id="status">Ready. Setup (kNN + pairs) runs on the CPU; the 450-iteration optimization runs entirely on the GPU.</span>

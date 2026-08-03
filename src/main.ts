@@ -20,6 +20,10 @@ const sampleSel = document.getElementById("samples") as HTMLInputElement;
 const sampleOut = document.getElementById("samplesOut") as HTMLOutputElement;
 const sampleHint = document.getElementById("samplesHint") as HTMLElement;
 const speedSel = document.getElementById("speed") as HTMLSelectElement;
+const transportEl = document.getElementById("transport") as HTMLElement;
+const playBtn = document.getElementById("play") as HTMLButtonElement;
+const scrub = document.getElementById("scrub") as HTMLInputElement;
+const readoutEl = document.getElementById("readout") as HTMLElement;
 
 const status = (m: string) => (statusEl.textContent = m);
 
@@ -32,6 +36,13 @@ const status = (m: string) => (statusEl.textContent = m);
 const qs = new URLSearchParams(location.search);
 const KNN_MODE = qs.get("knn") === "cpu" ? "cpu" : "gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
+
+// Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
+// GPU memory, so the scrubber never reads positions back to the host — same
+// constraint as the live render path. At 65k points a frame is 520KB, so the
+// budget, not the iteration count, is what decides how many we keep.
+const HISTORY_BUDGET_BYTES = 128 << 20;
+const PLAYBACK_FPS = 60;
 
 // Colors for digits 0-9. Distinct hues, roughly matched in luminance so no one
 // class dominates visually.
@@ -147,11 +158,16 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------------------
 
 let running = false;
+// Bumped on every run so a previous run's render loop and resize handler stop
+// touching the canvas (their buffers belong to a device that is now stale).
+let runGen = 0;
 
 async function go() {
   if (running) return;
   running = true;
   startBtn.disabled = true;
+  const gen = ++runGen;
+  resetTransport();
 
   try {
     if (!navigator.gpu) throw new Error("WebGPU unavailable in this browser");
@@ -214,6 +230,29 @@ async function go() {
     const viewUniform = device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // --- Playback history --------------------------------------------------
+    // One slot per captured frame, plus slot 0 for the pre-optimization init.
+    // `stride` iterations are collapsed into one slot when the full trace would
+    // not fit the budget, so the timeline stays complete (just coarser).
+    const frameBytes = N * 8;
+    const budget = Math.min(HISTORY_BUDGET_BYTES, device.limits.maxBufferSize);
+    const maxFrames = Math.max(2, Math.floor(budget / frameBytes));
+    const stride = Math.max(1, Math.ceil(pm.totalIters / (maxFrames - 1)));
+    const frameCount = 1 + Math.ceil(pm.totalIters / stride);
+    // Which iteration each slot holds, for the readout.
+    const frameIters = new Int32Array(frameCount);
+
+    const posHistory = device.createBuffer({
+      size: frameCount * frameBytes,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    // The autoscale bounds are banked alongside the positions rather than
+    // recomputed on scrub, so a replayed frame is framed exactly as it was live.
+    const boundsHistory = device.createBuffer({
+      size: frameCount * 16,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
     const boundsPipe = device.createComputePipeline({
@@ -296,19 +335,16 @@ async function go() {
         new Float32Array([canvas.width, canvas.height, radius, 0])
       );
     }
-    window.addEventListener("resize", resize);
+    window.addEventListener("resize", () => {
+      if (gen === runGen) resize();
+    });
     resize();
 
-    function draw() {
-      const enc = device.createCommandEncoder();
-
-      const cp = enc.beginComputePass();
-      cp.setPipeline(boundsPipe);
-      cp.setBindGroup(0, boundsBG);
-      cp.dispatchWorkgroups(1);
-      cp.end();
-      enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, 16);
-
+    function encodeRender(
+      enc: GPUCommandEncoder,
+      posBuf: GPUBuffer,
+      offset: number
+    ) {
       const rp = enc.beginRenderPass({
         colorAttachments: [
           {
@@ -321,11 +357,40 @@ async function go() {
       });
       rp.setPipeline(renderPipe);
       rp.setBindGroup(0, renderBG);
-      rp.setVertexBuffer(0, pm.positions);
+      rp.setVertexBuffer(0, posBuf, offset, frameBytes);
       rp.setVertexBuffer(1, labelBuf);
       rp.draw(6, N);
       rp.end();
+    }
 
+    /** Reduce bounds over the live positions, bank both into `slot`, and draw. */
+    function captureAndDraw(slot: number) {
+      const enc = device.createCommandEncoder();
+
+      const cp = enc.beginComputePass();
+      cp.setPipeline(boundsPipe);
+      cp.setBindGroup(0, boundsBG);
+      cp.dispatchWorkgroups(1);
+      cp.end();
+      enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, 16);
+      enc.copyBufferToBuffer(boundsStorage, 0, boundsHistory, slot * 16, 16);
+      enc.copyBufferToBuffer(
+        pm.positions,
+        0,
+        posHistory,
+        slot * frameBytes,
+        frameBytes
+      );
+
+      encodeRender(enc, pm.positions, 0);
+      device.queue.submit([enc.finish()]);
+    }
+
+    /** Draw a banked frame. No compute, no readback — two copies and a pass. */
+    function drawFrame(slot: number) {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(boundsHistory, slot * 16, boundsUniform, 0, 16);
+      encodeRender(enc, posHistory, slot * frameBytes);
       device.queue.submit([enc.finish()]);
     }
 
@@ -334,35 +399,92 @@ async function go() {
       `${N} points · PCA ${tPca | 0}ms · kNN+pairs ${tSetup | 0}ms · optimizing…`
     );
 
+    scrub.max = String(frameCount - 1);
+    transportEl.hidden = false;
+
+    // Capture must happen on `stride` boundaries, so the loop steps in chunks
+    // of `stride` and presents every `chunks` of them — that keeps the
+    // iters/frame selector meaningful without dropping frames from the trace.
+    const chunks = Math.max(1, Math.round(stepsPerFrame / stride));
     let it = 0;
+    let slot = 0;
+    frameIters[0] = 0;
+    captureAndDraw(0); // the Gaussian init, before any optimizer step
+
     const tOpt = performance.now();
     while (it < pm.totalIters) {
-      const next = Math.min(it + stepsPerFrame, pm.totalIters);
-      pm.runRange(it, next); // optimizer steps stay entirely on the GPU
-      it = next;
-      draw(); // reads pm.positions directly as a vertex buffer
-      iterEl.textContent = `${it} / ${pm.totalIters}`;
-      phaseEl.textContent =
-        it <= 100 ? "1 · global (w_MN 1000→3)"
-        : it <= 200 ? "2 · local refine"
-        : "3 · attract-repel";
+      for (let c = 0; c < chunks && it < pm.totalIters; c++) {
+        const next = Math.min(it + stride, pm.totalIters);
+        pm.runRange(it, next); // optimizer steps stay entirely on the GPU
+        it = next;
+        slot++;
+        frameIters[slot] = it;
+        captureAndDraw(slot); // reads pm.positions directly as a vertex buffer
+      }
+      scrub.value = String(slot);
+      setReadout(slot);
       await frame();
     }
     const elapsed = performance.now() - tOpt;
 
+    const mb = ((frameCount * frameBytes) / (1 << 20)).toFixed(0);
     status(
       `${N} points · PCA ${tPca | 0}ms · kNN+pairs ${tSetup | 0}ms · ` +
         `${pm.totalIters} iters in ${elapsed | 0}ms ` +
-        `(${(elapsed / pm.totalIters).toFixed(2)}ms/iter, includes render + rAF)`
+        `(${(elapsed / pm.totalIters).toFixed(2)}ms/iter, includes render + rAF) · ` +
+        `${frameCount} frames banked on the GPU (${mb}MB` +
+        `${stride > 1 ? `, every ${stride}th iter` : ""})`
     );
 
-    // Keep redrawing so resizing still works after convergence.
-    const idle = () => {
-      resize();
-      draw();
-      requestAnimationFrame(idle);
+    // --- Playback ----------------------------------------------------------
+    playhead = frameCount - 1;
+    setPlaying(false);
+    playBtn.disabled = false;
+    scrub.disabled = false;
+    onSeek = (f) => {
+      playhead = Math.max(0, Math.min(f, frameCount - 1));
+      scrub.value = String(playhead);
+      setReadout(playhead);
     };
-    idle();
+    onPlayToggle = () => {
+      // Restarting from the top at the end is what a player is expected to do.
+      if (!playing && playhead >= frameCount - 1) onSeek!(0);
+      setPlaying(!playing);
+    };
+    setReadout(playhead);
+
+    function setReadout(f: number) {
+      f = Math.round(f);
+      const iter = frameIters[f];
+      iterEl.textContent = `${iter} / ${pm.totalIters}`;
+      phaseEl.textContent =
+        iter <= 100 ? "1 · global (w_MN 1000→3)"
+        : iter <= 200 ? "2 · local refine"
+        : "3 · attract-repel";
+      readoutEl.textContent = `frame ${f + 1} / ${frameCount}`;
+    }
+
+    // Keeps drawing after convergence so resizing still works, and advances the
+    // playhead when playing.
+    let last = performance.now();
+    const tick = (now: number) => {
+      if (gen !== runGen) return; // a newer run owns the canvas
+      const dt = (now - last) / 1000;
+      last = now;
+      if (playing) {
+        const next = playhead + dt * PLAYBACK_FPS;
+        if (next >= frameCount - 1) {
+          onSeek!(frameCount - 1);
+          setPlaying(false);
+        } else {
+          onSeek!(next);
+        }
+      }
+      resize();
+      drawFrame(Math.round(playhead));
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   } catch (e) {
     status(`Error: ${(e as Error).message}`);
     console.error(e);
@@ -376,6 +498,58 @@ async function go() {
 function frame(): Promise<void> {
   return new Promise((r) => requestAnimationFrame(() => r()));
 }
+
+// ---------------------------------------------------------------------------
+// Transport (play/pause + scrubber)
+//
+// The controls live here, at module scope, but the frames they address are
+// per-run GPU buffers, so the run installs `onSeek`/`onPlayToggle` once its
+// history exists. Before that the buttons are disabled and these stay null.
+// ---------------------------------------------------------------------------
+
+let playing = false;
+/** Fractional frame index; the render loop rounds it to a banked slot. */
+let playhead = 0;
+let onSeek: ((f: number) => void) | null = null;
+let onPlayToggle: (() => void) | null = null;
+
+function setPlaying(on: boolean) {
+  playing = on;
+  playBtn.textContent = on ? "❚❚" : "▶";
+}
+
+function resetTransport() {
+  transportEl.hidden = true;
+  onSeek = null;
+  onPlayToggle = null;
+  setPlaying(false);
+  playhead = 0;
+  playBtn.disabled = true;
+  scrub.disabled = true;
+  scrub.value = "0";
+  readoutEl.textContent = "—";
+}
+
+playBtn.addEventListener("click", () => onPlayToggle?.());
+scrub.addEventListener("input", () => {
+  setPlaying(false);
+  onSeek?.(Number(scrub.value));
+});
+
+window.addEventListener("keydown", (e) => {
+  const tag = (e.target as HTMLElement | null)?.tagName;
+  // Sliders and buttons already handle these keys themselves.
+  if (tag === "SELECT" || tag === "INPUT" || tag === "BUTTON") return;
+  const step = e.shiftKey ? 10 : 1;
+  if (e.code === "Space") {
+    e.preventDefault();
+    onPlayToggle?.();
+  } else if (e.code === "ArrowRight" || e.code === "ArrowLeft") {
+    e.preventDefault();
+    setPlaying(false);
+    onSeek?.(Math.round(playhead) + (e.code === "ArrowRight" ? step : -step));
+  }
+});
 
 // ---------------------------------------------------------------------------
 // kNN self-check (?knncheck=1)
