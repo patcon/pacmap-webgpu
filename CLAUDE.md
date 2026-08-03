@@ -26,7 +26,7 @@ Pipeline, in order (`src/main.ts` `go()` wires it all):
 3. `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
 4. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, playback transport, Tweakpane view controls, DOM/status.
 
-The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `pacmap` (n_neighbors, MN/FP pair ratios, seed) is setup-time: pairs are sampled and the CSR built before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit.
+The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `pacmap` (kNN backend, n_neighbors, MN/FP pair ratios, seed) is setup-time: the kNN graph is built and pairs sampled before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight. The `kNN` dropdown is seeded from `?knn=` and owns the value after that. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit.
 
 The transport bar is always present. It never hides — it goes inert (controls disabled, readout `—`) so a run doesn't reflow the canvas.
 
@@ -43,7 +43,16 @@ A frame costs `N*8` bytes, so `HISTORY_BUDGET_BYTES` (128MB), not the iteration 
 CPU, once at setup: sigma scaling, pair sampling (near / mid-near / further), CSR build.
 GPU: brute-force kNN (`knnGPU`, one thread per query, bounded insertion sort in registers), then 450 iterations of gradient accumulation + Adam, fully resident.
 
-`bruteForceKnn` is the CPU reference for the same computation, kept as a correctness oracle and selectable via the `knn: "cpu"` option. The two are not bit-identical (JS accumulates in f64, WGSL in f32), so near-ties swap order; recall, not exact-order agreement, is the metric. The demo's `?knncheck=1` runs both over the same input and reports it (`?knn=cpu` forces the CPU path).
+`bruteForceKnn` is the CPU reference for the same computation, kept as a correctness oracle and selectable via the `knn: "cpu"` option. The two are not bit-identical (JS accumulates in f64, WGSL in f32), so near-ties swap order; recall, not exact-order agreement, is the metric.
+
+There is a third backend, `nndescentGPU` (`knn: "nndescent"`), approximate rather than exact. It is **slower than both brute-force paths at every size this demo reaches** — it exists for the asymptotics (past ~100k nothing else is viable) and as something to compare against, not as an optimization. Measured recall is ~99.9% at N=2000–5000 with k=60. Two things about it are worth knowing before touching it:
+
+- It is the one path that is **not deterministic**. The reverse-neighbor list is capped at `revCap` entries and filled first-writer-wins, which is a race; repeated runs at a fixed seed agree to about 1e-5 of recall. The cap is what bounds worst-case work — MNIST has hub points that thousands of rows point at, and an uncapped reverse list would hand one thread all of them.
+- Its join kernel reads rows other threads are concurrently writing. That is safe *by construction*, not by luck: only indices are read across rows, never distances, so a torn read yields a stale or duplicate candidate index (which the dedup scan handles) and never a mismatched index/distance pair. Don't "fix" it by double-buffering.
+
+`?knncheck=1` runs every backend over one identical input, scoring each against the CPU oracle, and reports recall / exact-order / max rel Δd² / ms. `?knn=cpu|nnd` picks a backend, as does the pane's `kNN` dropdown.
+
+Note that the demo cannot be verified headlessly, but the *library* can: `npx esbuild src/pacmap-webgpu.ts --bundle --format=esm --platform=neutral` produces a bundle that runs under `@kmamal/gpu` (Dawn bindings for Node), which compiles the real WGSL and executes the kernels. Both kNN shaders shipped broken once because they were committed without ever being compiled — a WGSL parse error takes out every pipeline at once and the failure looks like a plausible blob rather than an error. Compile shaders before committing them.
 
 Three design decisions carry most of the file:
 
@@ -53,12 +62,14 @@ Three design decisions carry most of the file:
 
 `PacmapRun.positions` is created with `VERTEX` usage and bound directly as a vertex buffer by the renderer — no `mapAsync`, no pipeline stall, so per-iteration animation costs nothing extra. `read()` exists but is only for host readback, not the render path. Same reason the bounds/autoscale reduce in `main.ts` is a single-workgroup GPU pass: the render loop must never read positions back.
 
-Known deviations from the reference PaCMAP, deliberate and documented at their sites: Gaussian init rather than PCA init (so layouts vary by `seed` — change it in the `pacmapWebGPU` call), and no PCA-to-100d inside the library (the demo does it upstream).
+Known deviations from the reference PaCMAP, deliberate and documented at their sites: Gaussian init rather than PCA init (so layouts vary by `seed` — change it in the `pacmapWebGPU` call), and no PCA-to-100d inside the library (the demo does it upstream). A third applies only under `knn: "nndescent"`: that path is not reproducible at a fixed seed (see above). Note the exact kNN is itself a deviation in the other direction — upstream uses ANNOY, so it is approximate too.
 
 One more, easy to miss: omitting `nNeighbors` falls back to `defaultNeighbors(N)`, the `10 + 15*(log10(N) - 4)` rule. Upstream that rule is opt-in — `PaCMAP.__init__` defaults `n_neighbors=10` and only consults the rule when the caller passes `None` explicitly — so the library's implicit default is *not* the reference's. The demo passes 10 unless "auto neighbors" is ticked.
 
 ### Performance shape
 
-The optimizer has never been the bottleneck — all 450 GPU iterations stay well under a second. With kNN moved to the GPU, the remaining cost is the CPU PCA (~4·n·d·k MACs of plain JS, tens of seconds at 65k); porting those matmuls to WGSL is the next real win. Above ~100k points O(N²) kNN stops being viable at any throughput and NN-Descent would be needed.
+The optimizer has never been the bottleneck — all 450 GPU iterations stay well under a second. With kNN moved to the GPU, the remaining cost is the CPU PCA (~4·n·d·k MACs of plain JS, tens of seconds at 65k); porting those matmuls to WGSL is the next real win.
+
+Above ~100k points O(N²) kNN stops being viable at any throughput, which is what `nndescentGPU` is for. It does not help below that: it measures several times slower than the brute-force kernel at N=2000–5000, narrowing as N grows but not crossing over anywhere near 65k. The reason is memory, not arithmetic — see its docstring. Making it competitive would mean attacking the scattered candidate reads (a workgroup per point with a cooperative distance reduction, rather than a thread per point) and adding the new/old flag sampling this variant drops.
 
 Long CPU loops in `pca.ts` yield to the event loop on a time slice (`Pacer`, `MessageChannel` rather than `setTimeout(0)` to dodge the 4ms nested clamp) so the page keeps painting progress. This is why `pcaProject` is `async`.

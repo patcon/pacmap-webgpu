@@ -600,12 +600,20 @@ fn nnd_join(@builtin(global_invocation_id) gid : vec3<u32>) {
  *
  * - **Not bit-reproducible.** The reverse-list cap is first-R-writers-win, and
  *   that race is not seeded. Same seed, slightly different graph, slightly
- *   different layout. `knnGPU` and `bruteForceKnn` remain deterministic.
- * - **Cost is `~N*K^2*D` per iteration**, not `N^2*D`. Since `candidateCount`
- *   asks for `nNB + 50` candidates, K is large (60 by default) and K^2 is close
- *   enough to N at MNIST scale that this does not reliably win. It is the
- *   asymptotics that matter — past ~100k, where N^2 stops being viable at any
- *   throughput, this is the only one of the three still standing.
+ *   different layout. `knnGPU` and `bruteForceKnn` remain deterministic. This is
+ *   observable: repeated runs at a fixed seed agree to about 1e-5 of recall.
+ * - **It is slower than brute force at every size this demo reaches.** Measured
+ *   several times slower than `knnGPU` at N=2000-5000, narrowing as N grows but
+ *   nowhere near crossing over by 65k. Cost is `~N*K^2*D` per iteration against
+ *   brute force's `N^2*D`, which should win — but `candidateCount` asks for
+ *   `nNB + 50` candidates, so K is large (60 by default), and more importantly
+ *   each thread walks its own scattered candidate set while `knn_main` has every
+ *   thread in a workgroup hitting the same address at once. That memory pattern,
+ *   not the arithmetic, is what dominates.
+ *
+ * So this is here for the asymptotics and for comparison, not as an
+ * optimization: past ~100k, where `N^2` stops being viable at any throughput,
+ * it is the only one of the three still standing. Below that, use `knnGPU`.
  */
 export async function nndescentGPU(
   device: GPUDevice,

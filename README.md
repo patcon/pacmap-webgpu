@@ -16,7 +16,7 @@ Safari 26). Check `navigator.gpu` in the console if the page reports no adapter.
 |---|---|---|
 | MNIST decode | CPU | TF.js sprite PNG, chunked through a canvas |
 | PCA 784 → 100 | CPU | randomized range finder, `src/pca.ts` — the setup bottleneck |
-| kNN | **GPU** | brute force, one thread per query, `knnGPU` |
+| kNN | **GPU** | brute force by default, one thread per query, `knnGPU`; NN-Descent and a CPU reference also selectable |
 | Sigma scaling + pair sampling | CPU | near / mid-near / further, CSR build |
 | 450 optimizer iterations | **GPU** | gradient + Adam, no host round-trip |
 | Bounds / autoscale | **GPU** | single-workgroup reduce |
@@ -38,20 +38,43 @@ kNN used to dominate that: O(N²·D) on the CPU is ~60s at 10k and roughly 40
 minutes at 65k. It now runs as a WGSL kernel, one thread per query with a
 bounded insertion sort in registers, which is what makes the top of the slider
 reachable at all. What's left is the CPU PCA — ~4·n·d·k MACs of plain JS, tens
-of seconds at 65k. Porting those matmuls to WGSL is the next real win. Past
-~100k points O(N²) stops being viable at any throughput and NN-Descent would be
-needed.
+of seconds at 65k. Porting those matmuls to WGSL is the next real win.
 
-The CPU implementation is still there as the correctness oracle. Two URL
-switches:
+## Three kNN backends
 
-- `?knn=cpu` — force the CPU path
-- `?knncheck=1` — run both over the same input and report recall, exact-order
-  agreement, and the measured speedup on your machine
+Pick one from the `kNN` dropdown in the pane, or with `?knn=`:
 
-They aren't bit-identical (JS accumulates distances in f64, WGSL in f32), so
-near-ties legitimately swap order. Recall is the metric that would catch a
-broken kernel; exact-order agreement is reported only as colour.
+| Backend | | Notes |
+|---|---|---|
+| brute force (GPU) | `?knn=gpu` | default; exact, one thread per query |
+| NN-Descent (GPU) | `?knn=nnd` | approximate, ~99.9% recall |
+| brute force (CPU) | `?knn=cpu` | exact; the oracle, ~40 minutes at 65k |
+
+**NN-Descent is slower than brute force here, and that is the honest result.**
+Past ~100k points O(N²) stops being viable at any throughput and NN-Descent is
+the only one of the three left standing — but 65k is not past 100k. It measures
+several times slower than the brute-force kernel at N=2000–5000, narrowing as N
+grows without coming close to crossing over. The cause is memory rather than
+arithmetic: brute force has every thread in a workgroup reading the same
+candidate row at the same instant, which broadcasts and caches, while NN-Descent
+has each thread walking its own scattered candidate set. It's here for the
+asymptotics and for comparison. Being approximate does put it closer to the
+reference PaCMAP than the exact paths, which use ANNOY.
+
+It's also the one backend that isn't reproducible run-to-run: its reverse-
+neighbor lists are capped and filled first-writer-wins, which is a race. Fixed
+seed, repeated runs, recall agrees to about 1e-5.
+
+`?knncheck=1` runs every backend over one identical input and scores each
+against the CPU oracle, reporting recall, exact-order agreement, max relative
+Δd², and wall clock.
+
+Nothing agrees bit-for-bit even among the exact backends (JS accumulates
+distances in f64, WGSL in f32), so near-ties legitimately swap order. Recall is
+the metric that would catch a broken kernel. Read the other two per backend: for
+an exact backend a low exact-order score means a bug, while for NN-Descent both
+are *expected* to move, and max rel Δd² becomes a measure of how much worse the
+substituted neighbor is.
 
 ## Files
 
@@ -64,6 +87,7 @@ broken kernel; exact-order agreement is reported only as colour.
 
 - Gaussian init rather than PCA init, so layouts vary by seed. Change `seed` in
   the `pacmapWebGPU` call to reshuffle.
+- Under `?knn=nnd` the seed doesn't fully determine the layout — see above.
 - The PCA output spans the top-100 principal subspace but isn't rotated to the
   principal axes. Distances are unaffected; per-axis variance ordering is not
   meaningful.
