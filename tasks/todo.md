@@ -116,14 +116,31 @@ no browser to confirm it in. Left as a known, sited improvement.
 **Untested here:** every acceptance criterion in this task is a browser behaviour.
 The build and all four checks are green, but no stop has actually been clicked.
 
-- [ ] **5. Document it** — XS — deps: 4
+- [x] **5. Document it** — S — deps: 4
       `CLAUDE.md`
-      - [ ] `check:druid` in the commands block and in the checks-at-different-levels
-            paragraph — it covers a level the other three do not
-      - [ ] CPU backend deviations: PCA init vs Gaussian, druid's own exact kNN, f64 vs
-            f32, upload-per-frame rather than readback
-      - [ ] LGPL-3.0-or-later note on the dependency
+      - [x] `check:druid` in the commands block and in the checks-at-different-levels
+            paragraph — "the four sit at different levels"; it covers a level the other
+            three do not, and is the one needing no GPU
+      - [x] New section on the three druid files: `EmbeddingRun`, the Matrix-vs-rows
+            and `generator()`-vs-`next()` decisions, the param-mapping hazard
+      - [x] CPU backend deviations: PCA init vs Gaussian (so the engines disagree at a
+            shared seed), druid's own exact kNN, f64 vs f32, upload-per-frame rather
+            than readback
+      - [x] Measured cost coefficients and what the slider hint extrapolates from
+      - [x] Stop button: why a cooperative check cannot implement it
+      - [x] LGPL-3.0-or-later note on the dependency
+      - [x] Stale passages corrected, not just additions: folder retitled, options map
+            now `Record<string, AlgoKey>`, Tweakpane no longer "the only runtime
+            dependency", intro and pipeline list mention four algorithms, playback
+            bounded by `banked`, and the known-coverage-gap paragraph now names two
 
-### Checkpoint: Complete
-- [ ] `npm run build`, `check:shaders`, `check:kernels`, `check:druid` all clean
-- [ ] Five commits on `main`
+### ✅ Checkpoint: Complete
+- [x] `npm run build`, `check:shaders` (6), `check:kernels` (16), `check:druid` (17)
+      all clean; `check:ab` bit-identical on both variants
+- [x] Five commits on `main`, one per task
+
+### Still open — browser only
+- [ ] Task 4's stop behaviours: stop during druid setup (the case a cooperative check
+      would miss), stop mid-optimize, scrubber over the partial trace, no orphaned
+      worker afterwards
+- [ ] The four-way dropdown and cost hint exercised across all four entries

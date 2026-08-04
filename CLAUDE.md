@@ -11,39 +11,48 @@ npm run build    # tsc --noEmit && vite build
 npm run preview
 npm run check:shaders   # compile every WGSL source under Dawn
 npm run check:kernels   # run the kernels under Dawn and check what they produce
+npm run check:druid     # run the DruidJS CPU backends (no GPU needed)
 npm run check:ab        # did this change move the embedding? (dev tool, not CI)
 ```
 
-There is no unit-test framework and no linter. The automated checks are `npm run build` (i.e. `tsc --noEmit`), `check:shaders` and `check:kernels`; CI runs all three. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`, and `scripts/` is type-checked alongside `src/`.
+There is no unit-test framework and no linter. The automated checks are `npm run build` (i.e. `tsc --noEmit`), `check:shaders`, `check:kernels` and `check:druid`; CI runs all four. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`, and `scripts/` is type-checked alongside `src/`.
 
-The three sit at different levels and it is worth keeping them straight. `check:shaders` asks whether the WGSL compiles and pipelines. `check:kernels` asks whether the kernels compute the right thing — it runs them for real and compares against a CPU oracle, asserts invariants, or runs the same thing twice and demands the same answer. `check:ab` asks whether a change moved the embedding, which needs a baseline (a git ref) and returns a number to interpret rather than a verdict, so it stays out of CI. Reach for it on any refactor that is supposed to preserve behavior.
+The four sit at different levels and it is worth keeping them straight. `check:shaders` asks whether the WGSL compiles and pipelines. `check:kernels` asks whether the kernels compute the right thing — it runs them for real and compares against a CPU oracle, asserts invariants, or runs the same thing twice and demands the same answer. `check:druid` asks about the *other* implementation: not whether druid's mathematics are right, which is druid's business, but whether our use of it is — the parameter names it is handed, and the two performance decisions the worker rests on. `check:ab` asks whether a change moved the embedding, which needs a baseline (a git ref) and returns a number to interpret rather than a verdict, so it stays out of CI. Reach for it on any refactor that is supposed to preserve behavior.
 
-Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. **The demo** cannot be verified headlessly — the DOM, the pane, the renderer and the playback transport all need a browser. The library can, and `scripts/` is how.
+`check:druid` is also the one that needs no GPU at all — the druid path is plain JS, so it runs anywhere Node does. It rides in CI's `gpu` job regardless, because like the other behaviour checks it should report a regression rather than break a page that tsc and vite already accepted.
+
+Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. **The demo** cannot be verified headlessly — the DOM, the pane, the renderer and the playback transport all need a browser. The library can, and `scripts/` is how; so can the DruidJS backends, which need neither a browser nor a GPU. What that leaves uncovered is the *wiring* — the worker handshake, the dropdown, the stop button — so a change to `main.ts` still wants a browser before it is believed.
 
 ## Architecture
 
-Single-page Vite demo: MNIST → randomized PCA → PaCMAP (or LocalMAP) dimensionality reduction → animated scatter plot. The organizing constraint is **once setup finishes, the 2D positions never leave GPU memory**.
+Single-page Vite demo: MNIST → randomized PCA → PaCMAP (or LocalMAP) dimensionality reduction → animated scatter plot. The organizing constraint is **once setup finishes, the 2D positions never leave GPU memory**. Four algorithms are selectable: PaCMAP and LocalMAP, each as this repo's WGSL implementation or as DruidJS running on the CPU in a worker. The constraint holds for all four — the CPU engine *uploads* each frame into a GPU buffer, and nothing is ever mapped back on the render path.
 
 Pipeline, in order (`src/main.ts` `go()` wires it all):
 
 1. `src/mnist.ts` — fetches the TF.js-hosted 784×65000 sprite PNG and decodes it through a canvas in 2500-row chunks (the full decode is ~200MB of RGBA transiently). Labels are stored one-hot, 10 uint8 per example.
 2. `src/pca.ts` — `pcaProject` reduces 784→100 on the CPU via a randomized range finder (no SVD). Output **spans** the top-k principal subspace but is not rotated to the principal axes, so per-axis variance ordering is meaningless. That's acceptable because the only consumer is a distance computation. An SVD of `B` would be needed to get true axis-ordered components (e.g. for PC1/PC2 init).
 3. `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
+   `src/druid-cpu.ts` + `src/druid-worker.ts` + `src/druid-protocol.ts` — the CPU
+   alternative, presenting the same `EmbeddingRun` surface. See its section below.
 4. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, playback transport, Tweakpane view controls, DOM/status.
 
-The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `algorithm` (variant, low_dist_thres, kNN backend, n_neighbors, MN/FP pair ratios, seed) is setup-time: the kNN graph is built and pairs sampled before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight. The `algorithm` and `kNN algo` dropdowns are seeded from `?algo=` and `?knn=` and own their values after that. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit.
+The pane has two folders with different lifetimes. `view` is live — an edit rewrites the current run's uniform. `dimensional reduction` (algorithm, low_dist_thres, kNN backend, n_neighbors, MN/FP pair ratios, seed) is setup-time: the kNN graph is built and pairs sampled before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight — which is now the only thing signalling that lifetime, since the folder title no longer says "next run". The `algorithm` and `kNN algo` dropdowns are seeded from `?algo=` and `?knn=` and own their values after that. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit. Under the CPU engine it is resolved to `defaultNeighbors(N)` explicitly instead, because druid has no equivalent rule to fall back on.
 
-The `algorithm` options map is annotated `Record<string, Variant>` rather than inferred. Tweakpane types `options` as plain strings, so a typo in a *value* type-checks, and the library's `opts.variant ?? "pacmap"` would then quietly run PaCMAP while the pane claimed LocalMAP. The annotation is what makes that a build error. The `kNN algo` dropdown still has that hole.
+The `algorithm` dropdown carries **both** axes — which algorithm, and whose implementation — as one `AlgoKey` (`pacmap-gpu`, `localmap-cpu`, …), with `VARIANT_OF` / `ENGINE_OF` splitting it at the point of use. They are one control because there is no reason to pick "LocalMAP" and then separately pick "on the CPU", and one control cannot disagree with itself. Selecting a CPU entry greys out `kNN algo`: druid builds its own neighbour graph and would ignore it.
+
+The options map is annotated `Record<string, AlgoKey>` rather than inferred. Tweakpane types `options` as plain strings, so a typo in a *value* type-checks, and `VARIANT_OF[key]` would then be `undefined` while the pane claimed otherwise. The annotation is what makes that a build error, and it matters more at four entries than it did at two. The `kNN algo` dropdown still has that hole.
 
 The transport bar is always present. It never hides — it goes inert (controls disabled, readout `—`) so a run doesn't reflow the canvas.
 
-Tweakpane (the only runtime dependency) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
+Tweakpane (one of two runtime dependencies, the other being DruidJS) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
 
 ### Playback history (`main.ts`)
 
 The timeline scrubber replays banked frames, so it holds the same invariant as the live path: nothing is read back. During the run each captured iteration is copied into a slot of one big `posHistory` buffer (`VERTEX | COPY_DST`), and the bounds reduce for that iteration is copied into `boundsHistory` alongside it — replay is then two `copyBufferToBuffer` calls and a render pass, with no compute and no `mapAsync`. Banking the bounds rather than recomputing them on scrub is what makes a replayed frame framed exactly as it was live.
 
 A frame costs `N*8` bytes, so `HISTORY_BUDGET_BYTES` (128MB), not the iteration count, decides how many fit; above the budget the trace is captured every `stride` iterations rather than truncated. That is also why the run loop steps in `stride`-sized chunks and only presents every `stepsPerFrame`-worth of them.
+
+Playback is bounded by `banked` — frames actually captured — rather than by the planned `frameCount`, which are the same number for any run that finishes and differ when a run is stopped. A stopped run keeps its partial trace and stays fully scrubbable over it.
 
 ### The CPU/GPU split in `pacmap-webgpu.ts`
 
@@ -67,7 +76,7 @@ That mechanism goes further than compilation, which is what `scripts/check-kerne
 
 An oracle must not share code with what it checks. `check:kernels` recomputes the reverse CSR by bucket-then-flatten rather than calling `buildFpReverse`, and `buildFpReverse` stays unexported to keep that honest.
 
-One coverage gap is known and documented at its site: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
+Two coverage gaps are known, both of the same shape — the pieces are checked, the wiring between them is not. The second is `check:druid`, which covers the druid backends and the parameter mapping but not the worker handshake, the dropdown or the stop button; those need a browser. The first: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
 
 `npm run check:shaders` is that mechanism, standing: `scripts/check-shaders.ts` compiles all six WGSL sources under Dawn and builds the real pipeline for every entry point. Pipelines matter as much as modules — a renamed entry point, an incompatible bind-group layout, or a bad vertex/blend state compiles clean and fails only at `createPipeline`. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader.
 
@@ -102,7 +111,32 @@ The gradient shader sits at **8 storage buffers**, the default `maxStorageBuffer
 
 Known deviations from the reference PaCMAP, deliberate and documented at their sites: Gaussian init rather than PCA init (so layouts vary by `seed` — change it in the `pacmapWebGPU` call), and no PCA-to-100d inside the library (the demo does it upstream). A third applies only under `knn: "nndescent"`: that path is not reproducible at a fixed seed (see above). A fourth applies only under `variant: "localmap"`: the resample's draw budget bounds every rejection path, where upstream's bounds only two and can therefore not terminate (see the LocalMAP section). Note the exact kNN is itself a deviation in the other direction — upstream uses ANNOY, so it is approximate too.
 
+Those all concern `pacmap-webgpu.ts`. The DruidJS engine is a separate implementation with its own set — most importantly a PCA init where ours is Gaussian, which is why the two engines disagree at a shared seed; see its section.
+
 One more, easy to miss: omitting `nNeighbors` falls back to `defaultNeighbors(N)`, the `10 + 15*(log10(N) - 4)` rule. Upstream that rule is opt-in — `PaCMAP.__init__` defaults `n_neighbors=10` and only consults the rule when the caller passes `None` explicitly — so the library's implicit default is *not* the reference's. The demo passes 10 unless "auto neighbors" is ticked.
+
+### The DruidJS CPU backends (`druid-cpu.ts`, `druid-worker.ts`, `druid-protocol.ts`)
+
+DruidJS 0.9.0 ships its own `PaCMAP` and `LocalMAP` — written against the same upstream reference this repo tracks — so the demo offers them beside ours. That is the whole point of them: they are something to *compare against*, an independent reading of the same two papers, not a fallback for machines without WebGPU. The dropdown names both halves accordingly: `PaCMAP (GPU - custom)` versus `PaCMAP (CPU - druid)`.
+
+They satisfy `EmbeddingRun`, the surface `main.ts` binds its renderer, bounds reduce and playback history against, so all of that is reused rather than duplicated. `PacmapRun` extends `EmbeddingRun` and re-narrows `run`/`runRange` to `void`: stepping has to be awaitable for a worker, but the GPU path never awaits and should not start advertising that it might.
+
+**The no-readback invariant holds, and the direction is why.** `positions` is a real GPU buffer that the worker's snapshot is uploaded *into* with `writeBuffer`. An upload per captured frame is not what that constraint forbids; a `mapAsync` on the render path would be.
+
+Four things to know before touching this:
+
+- **Druid is handed a `Matrix`, not `Float64Array[]`.** Its `projection` getter returns `this.Y` by reference for a Matrix input but calls `to2dArray()` for either array form — and `generator()` reads `projection` every iteration. Rows would therefore allocate N fresh `Float64Array`s on every one of the 450 steps, all discarded, since frames are read only on capture boundaries. About 29 million throwaway arrays at 65k.
+- **The optimizer is driven through `generator()`, not a `next()` loop.** A generator that finishes or closes releases the WASM buffers druid holds between iterations; a hand-driven loop leaves them allocated until the worker dies.
+- Neither of those is visible in a layout that looks fine, so `check:druid` pins both: chunked pulls at uneven strides must match `transform()` bit-for-bit, and Matrix input must match row input.
+- **The parameter mapping lives in `druid-protocol.ts` so the check can import it.** Druid takes parameters as a plain object and silently ignores any key it does not recognise, so a misspelled `apply_pca` does not throw — it runs the default and returns a plausible embedding. That is the `check:shaders` failure mode one library over. `check:druid` compares the emitted key set against a list transcribed by hand from druid's `.d.ts`; deriving that list from the same source the builder uses would make a typo cancel out on both sides, which is the ordinary way an oracle that shares code with its subject catches nothing.
+
+**Deviations from the GPU path, expected rather than bugs.** Druid initializes from a scaled PCA embedding where ours uses a scaled Gaussian, so **the two engines do not converge to the same layout at the same seed and should not be expected to** — cluster structure is comparable, orientation and position are not. It computes in f64 throughout where the kernels use f32. It runs its own exact neighbour search, so the `kNN algo` dropdown does not apply. Both engines are given the demo's own PCA output with `apply_pca: false`, and both run `num_iters: [100, 100, 250]`, so the input and the iteration count are genuinely shared — without that the comparison would not mean anything.
+
+**Cost.** Measured at D=100 over N = 500…4000: **8.5e-8 s/N²** for the exact neighbour search, **2.7e-4 s/point** for all 450 iterations. That puts 65k at roughly 7 minutes — considerably better than `O(N²·D)` in a scripting language suggests, because the search is WASM-accelerated. `estimateSetupSecs` uses those coefficients to drive the sample-slider hint, which reads `run (CPU)` rather than `setup` because the optimizer is no longer the free part. It extrapolates a quadratic well past its measurements, so treat it as an order of magnitude, not a prediction.
+
+Large runs are not blocked, only costed — which is what makes the stop button load-bearing rather than a convenience. Note that a cooperative check cannot implement it: druid's neighbour search is a single synchronous call that owns the worker for minutes, so `DruidCpuOptions.signal` terminates the worker outright. The signal is also checked after PCA, the one long stretch neither engine can interrupt. A stop mid-step rejects the in-flight `runRange`; that rejection is caught and broken out of rather than thrown past the playback setup, because the frames banked before the stop are a valid trace and keeping them is the difference between stopping and reloading.
+
+`@saehrimnir/druidjs` is **LGPL-3.0-or-later**, the only copyleft dependency here, in a repo that has no LICENSE of its own. Worth resolving before this is distributed as anything but a demo.
 
 ### Performance shape
 
