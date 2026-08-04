@@ -60,12 +60,25 @@ One commit per task, straight to `main`. Both gates after every task:
             fails all 4; skipping `fp_sort` fails 3 of 4, confirming the atomic
             scatter really is unordered and the sort is load-bearing
 
-- [ ] **5. `fp_resample` — the draw** — S — deps: 4
+- [x] **5. `fp_resample` — the draw** — S — deps: 4
       `src/pacmap-webgpu.ts`
-      - [ ] ≤100 draws per slot from `hash3(seed, i*nFP + slot, round*128 + try) % N`
-      - [ ] rejects self, this-round duplicates, `NbFwd[i]`, and `|y_i − y_j|² > lowDistThres²`
-      - [ ] try counter increments on *every* draw and bails at `> 100`, matching the reference
-      - [ ] exhausted slot keeps its previous partner
+      - [x] ≤100 draws per slot from `hash3(seed, i*nFP + slot, round*128 + try) % N`
+      - [x] rejects self, this-round duplicates (held in registers, so the scan sees
+            only this round's picks as the reference's `result[]` does), `NbFwd[i]`,
+            and `|y_i − y_j|² > lowDistThres²`
+      - [x] **deviation:** the try budget bounds *every* rejection path. Upstream's
+            self-hit and distance-failure branches `continue` past its `count > 100`
+            escape, so a point with no eligible partner inside `low_dist_thres` never
+            terminates. Harmless-ish on a CPU, takes out the device on a GPU.
+      - [x] exhausted slot keeps its previous partner
+      - [x] behavioural test over line geometry (spacing 0.1, so "within thres" is
+            exactly "within 10 indices") + one deliberately isolated point:
+            all four rejection rules hold on 1939 redrawn slots, 61 exhausted slots
+            kept, isolated point terminates and keeps its partners, same round
+            reproduces bit-for-bit, different round differs.
+            Gate proven: removing the distance filter → 1907 violations; removing
+            the near-partner check → 287; ignoring `round` → caught by the
+            different-round assertion.
 
 - [ ] **6. Wire the chain into `runRange`** — S — deps: 5
       `src/pacmap-webgpu.ts`

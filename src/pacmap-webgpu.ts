@@ -1210,19 +1210,110 @@ const FP_WG = 64;
  *   Without it a fixed seed would stop determining the layout, which is a
  *   property only `nndescentGPU` is allowed to give up.
  */
-function fpShaderSource(N: number, nFP: number): string {
+function fpShaderSource(
+  N: number,
+  nFP: number,
+  nNB: number,
+  lowDistThres: number,
+  seed: number
+): string {
   return /* wgsl */ `
+struct Params {
+  w  : vec4<f32>,
+  bc : vec4<f32>,
+  it : vec4<f32>,   // iteration index, _, _, _
+};
+
 @group(0) @binding(0) var<storage, read_write> FpF : array<u32>;
 @group(0) @binding(1) var<storage, read_write> FpR : array<u32>;
 @group(0) @binding(2) var<storage, read_write> Cnt : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read>       Y   : array<f32>;
+@group(0) @binding(4) var<storage, read>       NbF : array<u32>;
+@group(0) @binding(5) var<uniform>             P   : Params;
 
 const N   : u32 = ${N}u;
 const NFP : u32 = ${nFP}u;
+const NNB : u32 = ${nNB}u;
+const SEED : u32 = ${seed >>> 0}u;
+// Compared squared, so the reference's euclid_dist(...) > low_dist_thres needs
+// no root here. Both sides are non-negative, so the comparison is equivalent.
+const THRES2 : f32 = ${lowDistThres * lowDistThres};
 // Same two-region layout grad_main reads: [0, N+1) offsets, then the indices.
 const FPR_BASE : u32 = ${N + 1}u;
 
-// FpF is declared read_write because the resample writes it; nothing in this
-// chain does.
+// Counter-based hash RNG, same one nnd_init uses: stateless, so a thread can
+// derive its whole draw sequence from (seed, slot, try) with nothing carried
+// between dispatches. That is what makes the resample reproducible where
+// upstream's np.random.randint is not.
+fn hash3(a : u32, b : u32, c : u32) -> u32 {
+  var h = (a * 0x9E3779B1u) ^ (b * 0x85EBCA6Bu) ^ (c * 0xC2B2AE35u);
+  h = h ^ (h >> 16u); h = h * 0x7FEB352Du;
+  h = h ^ (h >> 15u); h = h * 0x846CA68Bu;
+  return h ^ (h >> 16u);
+}
+
+// LocalMAP's local graph adjustment: redraw this point's further partners,
+// keeping only candidates that are already CLOSE in the embedding. That is what
+// turns the further-pair term from a global scatter into a local one, and it is
+// why the pair set cannot be fixed for the whole run.
+//
+// Rejects, in the reference's order: self, a partner already drawn this round,
+// one of this point's own near partners, and anything beyond THRES2.
+//
+// MAX_TRIES is a hard bound, which is a deliberate departure from the
+// reference's control flow. There, both the self-hit and the distance-failure
+// paths 'continue' past the 'if count > 100' escape, so a point with no
+// eligible partner inside low_dist_thres loops forever. On a CPU that is a hang
+// nobody hits often enough to notice; on a GPU it takes out the device. The
+// escape is plainly the intent, so it is applied to every rejection path.
+const MAX_TRIES : u32 = 100u;
+
+@compute @workgroup_size(${FP_WG})
+fn fp_resample(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+
+  let yi = vec2<f32>(Y[2u * i], Y[2u * i + 1u]);
+  let round = u32(P.it.x);
+  let base = i * NFP;
+
+  // Drawn into registers rather than straight into FpF, so the duplicate scan
+  // sees only this round's picks — matching the reference, whose result array
+  // holds -1 for slots not yet filled. N is the sentinel: no candidate equals it.
+  var picks : array<u32, ${nFP}>;
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) { picks[s] = N; }
+
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) {
+    for (var t : u32 = 0u; t < MAX_TRIES; t = t + 1u) {
+      let c = hash3(SEED, i * NFP + s, round * 128u + t) % N;
+      if (c == i) { continue; }
+
+      var reject = false;
+      for (var k : u32 = 0u; k < s; k = k + 1u) {
+        if (picks[k] == c) { reject = true; break; }
+      }
+      if (reject) { continue; }
+
+      // Short rows are padded with N, which matches no candidate.
+      for (var k : u32 = 0u; k < NNB; k = k + 1u) {
+        if (NbF[i * NNB + k] == c) { reject = true; break; }
+      }
+      if (reject) { continue; }
+
+      let d = yi - vec2<f32>(Y[2u * c], Y[2u * c + 1u]);
+      if (dot(d, d) > THRES2) { continue; }
+
+      picks[s] = c;
+      break;
+    }
+  }
+
+  // A slot that exhausted its budget keeps whatever partner it already had,
+  // which is what the reference does when it falls back to old_pair_FP.
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) {
+    if (picks[s] != N) { FpF[base + s] = picks[s]; }
+  }
+}
 
 @compute @workgroup_size(${FP_WG})
 fn fp_clear(@builtin(global_invocation_id) gid : vec3<u32>) {
