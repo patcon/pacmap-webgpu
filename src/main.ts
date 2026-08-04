@@ -44,17 +44,40 @@ type Variant = "pacmap" | "localmap";
 /** Which implementation runs the optimizer: our WGSL, or DruidJS off-thread. */
 type Engine = "gpu" | "cpu";
 
+/**
+ * Algorithm and implementation as one choice, because that is how it is picked.
+ *
+ * The two axes are not independent in the UI — there is no reason to select
+ * "LocalMAP" and then separately select "on the CPU" — and collapsing them into
+ * a single key keeps the dropdown one control rather than two that can disagree.
+ */
+type AlgoKey = `${Variant}-${Engine}`;
+
+const VARIANT_OF: Record<AlgoKey, Variant> = {
+  "pacmap-gpu": "pacmap",
+  "localmap-gpu": "localmap",
+  "pacmap-cpu": "pacmap",
+  "localmap-cpu": "localmap",
+};
+const ENGINE_OF: Record<AlgoKey, Engine> = {
+  "pacmap-gpu": "gpu",
+  "localmap-gpu": "gpu",
+  "pacmap-cpu": "cpu",
+  "localmap-cpu": "cpu",
+};
+
 const qs = new URLSearchParams(location.search);
 const KNN_MODE: KnnMode =
   qs.get("knn") === "gpu" ? "gpu"
   : qs.get("knn") === "nnd" || qs.get("knn") === "nndescent" ? "nndescent"
   : "cpu";
-// `pacmap` / `localmap` stay valid and mean the GPU implementations, which is
-// what they meant before there was a second one.
+// Bare `pacmap` / `localmap` still mean the GPU implementations — that is what
+// they meant before there was a second one, and links to them predate it.
 const ALGO_PARAM = qs.get("algo") ?? "";
-const ALGO_MODE: Variant =
-  ALGO_PARAM.startsWith("localmap") ? "localmap" : "pacmap";
-const ENGINE_MODE: Engine = ALGO_PARAM.endsWith("-cpu") ? "cpu" : "gpu";
+const ALGO_MODE: AlgoKey =
+  ALGO_PARAM in VARIANT_OF ? (ALGO_PARAM as AlgoKey)
+  : ALGO_PARAM === "localmap" ? "localmap-gpu"
+  : "pacmap-gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
@@ -119,9 +142,10 @@ async function go() {
 
     // Read once, here: the folder is disabled for the duration of the run, so
     // these are the values this run is committed to.
-    const variant = params.variant;
-    const engine = params.engine;
-    const algoLabel = ALGO_LABELS[variant];
+    const algorithm = params.algorithm;
+    const variant = VARIANT_OF[algorithm];
+    const engine = ENGINE_OF[algorithm];
+    const algoLabel = ALGO_LABELS[algorithm];
     // Druid runs its own exact neighbour search, so the kNN backend is a
     // GPU-engine concept and naming one under the CPU engine would be a lie.
     const knnLabel = engine === "cpu" ? "druid exact" : KNN_LABELS[params.knnMethod];
@@ -502,10 +526,7 @@ const params = {
   // them after that — comparing backends and variants is the point, and that
   // shouldn't need a reload.
   knnMethod: KNN_MODE,
-  variant: ALGO_MODE,
-  // Not in the pane yet — the four-way dropdown that exposes it is the next
-  // change. Until then `?algo=pacmap-cpu` is how you reach the CPU engine.
-  engine: ENGINE_MODE as Engine,
+  algorithm: ALGO_MODE,
   // Upstream's default. Only read under localmap.
   lowDistThres: 10,
 };
@@ -516,9 +537,17 @@ const KNN_LABELS: Record<KnnMode, string> = {
   cpu: "brute force (CPU)",
 };
 
-const ALGO_LABELS: Record<Variant, string> = {
-  pacmap: "PaCMAP",
-  localmap: "LocalMAP",
+/**
+ * Both halves of the choice, named where the reader is: which algorithm, and
+ * whose implementation of it. "custom" is the WGSL in `pacmap-webgpu.ts`;
+ * "druid" is DruidJS, an independent implementation of the same two papers,
+ * which is the entire point of offering it — a layout you can compare against.
+ */
+const ALGO_LABELS: Record<AlgoKey, string> = {
+  "pacmap-gpu": "PaCMAP (GPU - custom)",
+  "localmap-gpu": "LocalMAP (GPU - custom)",
+  "pacmap-cpu": "PaCMAP (CPU - druid)",
+  "localmap-cpu": "LocalMAP (CPU - druid)",
 };
 
 const pane = new Pane({
@@ -536,26 +565,46 @@ viewFolder
   })
   .on("change", () => onViewChange?.());
 
-const pacmapFolder = pane.addFolder({ title: "algorithm · next run" });
+const pacmapFolder = pane.addFolder({ title: "dimensional reduction" });
 
-// LocalMAP inherits every parameter below this, so it is a variant here rather
-// than a separate folder — which is also how upstream models it.
+// Every parameter below is shared by all four entries — LocalMAP inherits
+// PaCMAP's whole setup path upstream, and druid takes the same knobs our
+// library does — so this is one folder with a variant selector rather than a
+// folder per algorithm.
 //
 // The map is annotated rather than inferred on purpose. Tweakpane types
-// `options` as plain strings, so a typo in a *value* here type-checks, and the
-// library's `opts.variant ?? "pacmap"` would then quietly run PaCMAP while this
-// pane claimed otherwise. `Record<string, Variant>` is what makes that a build
-// error. (The kNN dropdown below has the same hole; separate change.)
-const ALGO_OPTIONS: Record<string, Variant> = {
-  [ALGO_LABELS.pacmap]: "pacmap",
-  [ALGO_LABELS.localmap]: "localmap",
+// `options` as plain strings, so a typo in a *value* here type-checks, and
+// `VARIANT_OF[key]` would then be undefined while the pane claimed otherwise.
+// `Record<string, AlgoKey>` is what makes that a build error, and it matters
+// more with four entries than it did with two. (The kNN dropdown below still
+// has the same hole; separate change.)
+const ALGO_OPTIONS: Record<string, AlgoKey> = {
+  [ALGO_LABELS["pacmap-gpu"]]: "pacmap-gpu",
+  [ALGO_LABELS["localmap-gpu"]]: "localmap-gpu",
+  [ALGO_LABELS["pacmap-cpu"]]: "pacmap-cpu",
+  [ALGO_LABELS["localmap-cpu"]]: "localmap-cpu",
 };
 
 pacmapFolder
-  .addBinding(params, "variant", { label: "algorithm", options: ALGO_OPTIONS })
-  .on("change", (e) => {
-    lowDistBinding.disabled = e.value === "pacmap";
-  });
+  .addBinding(params, "algorithm", {
+    label: "algorithm",
+    options: ALGO_OPTIONS,
+  })
+  .on("change", (e) => syncAlgorithm(e.value as AlgoKey));
+
+/**
+ * Grey out what the selected engine does not read, and refresh the cost hint.
+ *
+ * Both matter for honesty rather than tidiness: druid runs its own exact
+ * neighbour search, so leaving the kNN dropdown live under the CPU engine would
+ * imply a choice that has no effect, and the two engines' costs differ by orders
+ * of magnitude, so the hint is wrong until it is told which one is selected.
+ */
+function syncAlgorithm(key: AlgoKey) {
+  lowDistBinding.disabled = VARIANT_OF[key] === "pacmap";
+  knnBinding.disabled = ENGINE_OF[key] === "cpu";
+  updateSampleLabel();
+}
 
 // LocalMAP's only new knob. Read in two places — it scales the phase-3 near-pair
 // gradient (as lowDistThres/2) and bounds how far a redrawn further pair may sit
@@ -566,13 +615,14 @@ const lowDistBinding = pacmapFolder.addBinding(params, "lowDistThres", {
   max: 30,
   step: 0.5,
 });
-lowDistBinding.disabled = params.variant === "pacmap";
-
 // Ordered by how much the backend takes on trust: the CPU oracle first as the
 // default, then the exact GPU kernel, then the approximate one. No speed
 // annotation on any of them — measured, the ordering doesn't match what the
 // asymptotics suggest, so a label here would mislead.
-pacmapFolder.addBinding(params, "knnMethod", {
+//
+// Inert under the CPU engine: druid builds its own neighbour graph and never
+// consults this.
+const knnBinding = pacmapFolder.addBinding(params, "knnMethod", {
   label: "kNN algo",
   options: {
     [KNN_LABELS.cpu]: "cpu",
@@ -623,6 +673,10 @@ pacmapFolder.addBinding(params, "fpRatio", {
 // The seed drives pair sampling and the Gaussian init, so scrubbing it is how
 // you tell a stable structure from an artifact of one layout.
 pacmapFolder.addBinding(params, "seed", { min: 0, max: 999, step: 1 });
+
+// Bindings all exist now, so the pane can be brought in line with whatever
+// `?algo=` selected. Also draws the first cost hint.
+syncAlgorithm(params.algorithm);
 
 // ---------------------------------------------------------------------------
 // Transport (play/pause + scrubber)
@@ -805,21 +859,46 @@ async function knnSelfCheck(device: GPUDevice, Z: Float32Array, N: number) {
 // ---------------------------------------------------------------------------
 
 /**
- * Very rough setup-time estimate, so the cost of the high end is visible before
- * committing to a run. PCA dominates (~4*n*784*100 MACs of plain JS); the GPU
- * kNN term is small but quadratic, so it only starts to show past ~40k.
+ * Very rough cost estimate, so the price of the high end is visible before
+ * committing to a run.
+ *
+ * The shared prefix is PCA, ~4*n*784*100 MACs of plain JS. After that the two
+ * engines diverge by orders of magnitude, which is the reason this takes an
+ * engine at all: on the GPU the optimizer is free and the quadratic kNN term
+ * only shows past ~40k, while druid pays an exact O(N^2*D) neighbour search on
+ * one CPU thread and then runs 450 f64 iterations.
+ *
+ * The druid coefficients are measured, not derived — 8.5e-8 s/N^2 for the
+ * search and 2.7e-4 s/point for the whole optimizer, taken at D=100 over
+ * N = 500…4000. Extrapolating a quadratic four-fold is exactly the kind of
+ * estimate that should be distrusted, so treat the large end as an order of
+ * magnitude ("this is minutes, not seconds") rather than a prediction.
  */
-function estimateSetupSecs(n: number): number {
-  return (n * 784 * 100 * 4) / 5e8 + (n * n * 100) / 3e11 + n * 4e-5;
+function estimateSetupSecs(n: number, engine: Engine): number {
+  const pca = (n * 784 * 100 * 4) / 5e8;
+  return engine === "cpu"
+    ? pca + 8.5e-8 * n * n + 2.7e-4 * n
+    : pca + (n * n * 100) / 3e11 + n * 4e-5;
 }
 
 sampleSel.max = String(NUM_AVAILABLE);
 
+/** Seconds as something readable at both ends: 2.4s, 47s, 7min. */
+function humanSecs(s: number): string {
+  if (s < 10) return `${s.toFixed(1)}s`;
+  if (s < 90) return `${Math.round(s)}s`;
+  return `${Math.round(s / 60)}min`;
+}
+
 function updateSampleLabel() {
   const n = parseInt(sampleSel.value, 10);
   sampleOut.value = n.toLocaleString();
-  const s = estimateSetupSecs(n);
-  sampleHint.textContent = `~${s < 10 ? s.toFixed(1) : Math.round(s)}s setup`;
+  const engine = ENGINE_OF[params.algorithm];
+  const s = estimateSetupSecs(n, engine);
+  // The CPU figure covers the whole run, not just setup, because under druid
+  // the optimizer is no longer the free part.
+  sampleHint.textContent =
+    engine === "cpu" ? `~${humanSecs(s)} run (CPU)` : `~${humanSecs(s)} setup`;
   syncAutoNeighbors();
 }
 sampleSel.addEventListener("input", updateSampleLabel);

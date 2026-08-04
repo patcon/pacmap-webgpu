@@ -62,16 +62,29 @@ proves the two decisions this rests on are behaviour-preserving:
 `worker/chunked-generator-matches-transform` (uneven strides, bit-for-bit against
 `transform()`) and `worker/matrix-input-matches-rows`.
 
-- [ ] **3. Four-way dropdown and the cost hint** — S — deps: 2
+- [x] **3. Four-way dropdown and the cost hint** — S — deps: 2
       `src/main.ts`
-      - [ ] `params.algorithm: AlgoKey` replaces `params.variant`, options map still
-            annotated `Record<string, AlgoKey>` (a typo'd value must stay a build error)
-      - [ ] Labels: `PaCMAP (GPU - custom)`, `LocalMAP (GPU - custom)`,
+      - [x] `params.algorithm: AlgoKey` replaces `params.variant`/`params.engine`,
+            options map still annotated `Record<string, AlgoKey>` (a typo'd value must
+            stay a build error)
+      - [x] Labels: `PaCMAP (GPU - custom)`, `LocalMAP (GPU - custom)`,
             `PaCMAP (CPU - druid)`, `LocalMAP (CPU - druid)`
-      - [ ] `?algo=` takes the four keys; `pacmap`/`localmap` remain GPU aliases
-      - [ ] `kNN algo` disabled under a CPU engine; `low_dist_thres` live for `localmap-cpu`
-      - [ ] `estimateSetupSecs` CPU branch; hint refreshes on dropdown change
-      - [ ] Status line names the engine alongside the variant
+      - [x] `?algo=` takes the four keys; `pacmap`/`localmap` remain GPU aliases
+      - [x] `kNN algo` disabled under a CPU engine; `low_dist_thres` live for `localmap-cpu`
+      - [x] `estimateSetupSecs` takes an engine; hint refreshes on dropdown change and
+            reads "run (CPU)" rather than "setup", since under druid the optimizer is
+            no longer the free part
+      - [x] Status line names the engine alongside the variant (via the label)
+      - [x] Folder retitled `dimensional reduction` (was `algorithm · next run`).
+            Note this drops the "next run" signal; the folder still greys out mid-run,
+            which is what actually communicates it.
+
+**The cost model is measured, not derived.** Druid at D=100 over N=500…4000:
+**8.5e-8 s/N²** for the exact neighbour search and **2.7e-4 s/point** for all 450
+iterations. That puts N=65000 at **~7 min**, not the "minutes-to-hours" the plan
+assumed from asymptotics alone — the search is WASM-accelerated, which the
+O(N²·D) reading misses. Extrapolating a quadratic four-fold deserves distrust, so
+the hint is an order of magnitude, not a prediction.
 
 ### Checkpoint: Core
 - [ ] All four algorithms animate at N=2000
