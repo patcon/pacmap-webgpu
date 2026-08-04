@@ -6,21 +6,28 @@ One commit per task, straight to `main`. Gates after every task: `npm run build`
 
 ## Phase 1 — Foundation
 
-- [ ] **1. Dependency + headless check (`check:druid`)** — S — deps: none
-      `package.json`, `scripts/check-druid.ts`
-      - [ ] `@saehrimnir/druidjs` added; `check:druid` script (esbuild → node, no Dawn)
-      - [ ] Synthetic 4-blob dataset (~400 points, 20-d)
-      - [ ] Asserts: N×2 and finite, both classes
-      - [ ] Asserts: fixed seed reproduces bit-for-bit
-      - [ ] Asserts: PaCMAP ≠ LocalMAP at one seed
-      - [ ] Asserts: params are *read* — two runs differing only in `n_neighbors` differ
+- [x] **1. Dependency + headless check (`check:druid`)** — S — deps: none
+      `package.json`, `scripts/check-druid.ts`, `.github/workflows/pages.yml`
+      - [x] `@saehrimnir/druidjs` added; `check:druid` script (esbuild → node, no Dawn)
+      - [x] Synthetic 4-blob dataset (400 points, 20-d)
+      - [x] Asserts: N×2 and finite, both classes
+      - [x] Asserts: fixed seed reproduces bit-for-bit
+      - [x] Asserts: PaCMAP ≠ LocalMAP at one seed
+      - [x] Asserts: params are *read* — `n_neighbors` and `seed` each moved separately
             (the one that catches an option name druid silently ignores)
-      - [ ] Asserts: mean intra-blob 2-d distance < inter-blob
-      - [ ] Each assertion demonstrated failing before being trusted green
+      - [x] Asserts: mean intra-blob 2-d distance < inter-blob
+      - [x] Each assertion demonstrated failing before being trusted green
+      - [x] Added to the CI `gpu` job — a behaviour check, so it reports rather than
+            gating the page deploy, same as the other two
 
-### Checkpoint: Foundation
-- [ ] `npm run check:druid` green
-- [ ] Misspelling `n_neighbors` trips the params assertion
+### ✅ Checkpoint: Foundation
+- [x] `npm run check:druid` green — 11 checks
+- [x] Misspelling `n_neighbors` trips the params assertion (`agree to 0.00e+0`)
+
+Measured while landing this, and worth carrying into Task 3's cost estimate:
+450 iterations at N=400 cost **156ms** (PaCMAP) / **209ms** (LocalMAP), and the
+blob separation ratio sits at **0.055 / 0.122** against a 0.5 threshold, with a
+scrambled layout scoring 1.004 — the gate has room on both sides.
 
 ## Phase 2 — The backend
 

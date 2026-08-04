@@ -8,7 +8,8 @@
     "preview": "vite preview",
     "check:shaders": "esbuild scripts/check-shaders.ts --bundle --format=esm --platform=node --external:@kmamal/gpu --outfile=node_modules/.cache/check-shaders.mjs && node node_modules/.cache/check-shaders.mjs",
     "check:kernels": "esbuild scripts/check-kernels.ts --bundle --format=esm --platform=node --external:@kmamal/gpu --outfile=node_modules/.cache/check-kernels.mjs && node node_modules/.cache/check-kernels.mjs",
-    "check:ab": "esbuild scripts/ab-embedding.ts --bundle --format=esm --platform=node --external:@kmamal/gpu --outfile=node_modules/.cache/ab-embedding.mjs && node node_modules/.cache/ab-embedding.mjs"
+    "check:ab": "esbuild scripts/ab-embedding.ts --bundle --format=esm --platform=node --external:@kmamal/gpu --outfile=node_modules/.cache/ab-embedding.mjs && node node_modules/.cache/ab-embedding.mjs",
+    "check:druid": "esbuild scripts/check-druid.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache/check-druid.mjs && node node_modules/.cache/check-druid.mjs"
   },
   "devDependencies": {
     "@kmamal/gpu": "^0.2.1",
@@ -19,6 +20,7 @@
     "vite": "^5.4.0"
   },
   "dependencies": {
+    "@saehrimnir/druidjs": "^0.9.0",
     "tweakpane": "^4.0.5"
   }
 }

@@ -60,6 +60,10 @@ jobs:
       # reason if a module stopped compiling, and that message is the useful one.
       - run: npm run check:shaders -- --strict
       - run: npm run check:kernels -- --strict
+      # Needs no GPU — the druid backends are plain JS. It rides in this job
+      # anyway because it is a behaviour check, and the comment above applies to
+      # it identically: report a regression, don't break an accepted page.
+      - run: npm run check:druid
 
   deploy:
     needs: build
