@@ -37,6 +37,10 @@ const N = 2000;
 const D = 100;
 const K = 60;
 const R = 32;
+// round(n_neighbors * FP_ratio) at the demo's defaults (10 and 2.0). It sets
+// the length of a per-thread loop bound, not an array, but keeping it realistic
+// costs nothing.
+const NFP = 20;
 
 const STRICT = process.argv.includes("--strict");
 
@@ -101,8 +105,10 @@ const cases: Case[] = [
   },
   {
     name: "pacmap",
-    code: shaderSources.shaderSource(N),
+    code: shaderSources.shaderSource(N, NFP),
     build: (device, module) => {
+      // Eight storage buffers is the default per-stage limit, so this layout is
+      // also the check that the shader still fits inside it.
       const layout = computeLayout(device, [
         "storage",
         "read-only-storage",
@@ -111,6 +117,8 @@ const cases: Case[] = [
         "storage",
         "storage",
         "uniform-dynamic",
+        "read-only-storage",
+        "read-only-storage",
       ]);
       for (const entryPoint of ["grad_main", "adam_main"]) {
         device.createComputePipeline({ layout, compute: { module, entryPoint } });

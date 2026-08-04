@@ -77,10 +77,11 @@ const ADAM_B1 = 0.9;
 const ADAM_B2 = 0.999;
 const ADAM_EPS = 1e-7;
 
-// Pair type tags, packed into the top 2 bits of each adjacency entry.
+// Pair type tags, packed into the top 2 bits of each adjacency entry. Only the
+// two kinds the CSR still carries: further pairs moved to their own arrays when
+// LocalMAP made them mutable (see `Pairs`), so they never reach this packing.
 const T_NB = 0;
 const T_MN = 1;
-const T_FP = 2;
 
 // ---------------------------------------------------------------------------
 // RNG — deterministic so animation captures are reproducible
@@ -949,9 +950,24 @@ function dist2(X: Float32Array, D: number, a: number, b: number): number {
 // ---------------------------------------------------------------------------
 
 interface Pairs {
+  /** Near and mid-near only. Further pairs are `fpFwd` — see `buildCSR`. */
   i: Uint32Array;
   j: Uint32Array;
   t: Uint8Array;
+  /**
+   * N x nNB, row-major: i's own near partners, densely indexable from a shader.
+   * This is the reject list the LocalMAP resample needs, and it is the same set
+   * the T_NB entries of the CSR carry — kept separately because the CSR
+   * interleaves i's own pairs with the ones pointing back at it, and the
+   * resample must reject only the former. Short rows (possible only when
+   * kCand < nNB, i.e. at tiny N) are padded with N, which matches no candidate.
+   */
+  nbFwd: Uint32Array;
+  /**
+   * N x nFP, row-major: i's own further partners. Held outside the CSR because
+   * LocalMAP redraws it mid-run; under PaCMAP it simply never changes.
+   */
+  fpFwd: Uint32Array;
 }
 
 /** Candidate pool size the kNN stage must produce for `samplePairs`. */
@@ -990,10 +1006,13 @@ function samplePairs(
     sig[i] = Math.max(n > 0 ? s / n : 1e-10, 1e-10);
   }
 
-  const total = N * (nNB + nMN + nFP);
+  // Near and mid-near go to the CSR; further pairs go to their own dense array.
+  const total = N * (nNB + nMN);
   const pi = new Uint32Array(total);
   const pj = new Uint32Array(total);
   const pt = new Uint8Array(total);
+  const nbFwd = new Uint32Array(N * nNB).fill(N);
+  const fpFwd = new Uint32Array(N * nFP);
   let w = 0;
 
   // Reusable scratch for the rescale-and-reselect step.
@@ -1017,6 +1036,7 @@ function samplePairs(
     for (let k = 0; k < take; k++) {
       const j = idx[i * kCand + ord[k]];
       nbSet.add(j);
+      nbFwd[i * nNB + k] = j;
       pi[w] = i;
       pj[w] = j;
       pt[w] = T_NB;
@@ -1056,14 +1076,47 @@ function samplePairs(
         c = (rand() * N) | 0;
         if (c !== i && !nbSet.has(c)) break;
       }
-      pi[w] = i;
-      pj[w] = c;
-      pt[w] = T_FP;
-      w++;
+      fpFwd[i * nFP + f] = c;
     }
   }
 
-  return { i: pi.subarray(0, w), j: pj.subarray(0, w), t: pt.subarray(0, w) };
+  return {
+    i: pi.subarray(0, w),
+    j: pj.subarray(0, w),
+    t: pt.subarray(0, w),
+    nbFwd,
+    fpFwd,
+  };
+}
+
+/**
+ * Reverse adjacency for the further pairs: for each point, every point that
+ * drew it. One buffer, two regions — `[0, N+1)` is the offset table and
+ * everything after it is the index list, so the gradient shader spends one
+ * binding on this rather than two (it is already at the 8-storage-buffer limit).
+ *
+ * The GPU rebuilds this every 10 iterations under LocalMAP; this is the CPU
+ * build that seeds it, and the oracle its kernels were checked against.
+ *
+ * Sources land in ascending order because `i` ascends. `fp_scatter` on the GPU
+ * has no such guarantee — its cursor is atomic — which is why it is followed by
+ * a sort: the summation order of an f32 gradient has to be reproducible.
+ */
+function buildFpReverse(
+  N: number,
+  nFP: number,
+  fpFwd: Uint32Array
+): Uint32Array {
+  const out = new Uint32Array(N + 1 + N * nFP);
+
+  for (let p = 0; p < fpFwd.length; p++) out[fpFwd[p] + 1]++;
+  for (let i = 0; i < N; i++) out[i + 1] += out[i];
+
+  const cursor = out.slice(0, N);
+  for (let i = 0; i < N; i++) {
+    for (let f = 0; f < nFP; f++) out[N + 1 + cursor[fpFwd[i * nFP + f]]++] = i;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,7 +1184,7 @@ export const shaderSources = {
   shaderSource,
 };
 
-function shaderSource(N: number): string {
+function shaderSource(N: number, nFP: number): string {
   return /* wgsl */ `
 struct Params {
   w  : vec4<f32>,   // wNB, wMN, wFP, lr
@@ -1146,8 +1199,24 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> M    : array<f32>;
 @group(0) @binding(5) var<storage, read_write> V    : array<f32>;
 @group(0) @binding(6) var<uniform>             P    : Params;
+@group(0) @binding(7) var<storage, read>       FpF  : array<u32>;
+@group(0) @binding(8) var<storage, read>       FpR  : array<u32>;
 
-const N : u32 = ${N}u;
+const N   : u32 = ${N}u;
+const NFP : u32 = ${nFP}u;
+// FpR is one buffer holding two regions: [0, N+1) offsets, then the indices.
+const FPR_BASE : u32 = ${N + 1}u;
+
+// The further-pair force, shared by the forward and reverse loops below. The
+// sign works out for both from the one expression, exactly as it does for the
+// CSR's duplicated entries: the displacement flips between the two directions
+// while the scalar, a function of |d|^2 only, does not.
+fn fpForce(yi : vec2<f32>, j : u32) -> vec2<f32> {
+  let d = yi - vec2<f32>(Y[2u * j], Y[2u * j + 1u]);
+  let dd = 1.0 + dot(d, d);
+  let r = 1.0 + dd;
+  return (-P.w.z * 2.0 / (r * r)) * d;
+}
 
 // One thread per point. Gathers every pair this point participates in and sums
 // the force. The sign works out automatically: for the reverse entry the
@@ -1183,15 +1252,26 @@ fn grad_main(@builtin(global_invocation_id) gid : vec3<u32>) {
       //   PaCMAP, and LocalMAP up to n1+n2:  (1, 0)              -> unchanged
       //   LocalMAP after n1+n2:              (0, lowDistThres/2)
       c = P.w.x * 20.0 / (r * r) * (P.bc.z + P.bc.w * inverseSqrt(dd));
-    } else if (kind == 1u) {   // mid-near:  w * dd / (10000 + dd)
+    } else {                   // mid-near:  w * dd / (10000 + dd)
       let r = 10000.0 + dd;
       c = P.w.y * 20000.0 / (r * r);
-    } else {                   // further:   w * 1 / (1 + dd)
-      let r = 1.0 + dd;
-      c = -P.w.z * 2.0 / (r * r);
     }
 
     g = g + c * d;
+  }
+
+  // Further pairs, gathered from their own arrays rather than the CSR: this
+  // point's own NFP draws, then every point that drew this one. Together these
+  // are the same both-endpoints duplication buildCSR does for the other two
+  // kinds, split across two arrays instead of interleaved into one.
+  let fpBase = i * NFP;
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) {
+    g = g + fpForce(yi, FpF[fpBase + s]);
+  }
+  let rlo = FpR[i];
+  let rhi = FpR[i + 1u];
+  for (var p : u32 = rlo; p < rhi; p = p + 1u) {
+    g = g + fpForce(yi, FpR[FPR_BASE + p]);
   }
 
   Grad[2u * i]      = g.x;
@@ -1273,6 +1353,7 @@ export async function pacmapWebGPU(
   onStatus("Sampling pairs…");
   const pairs = samplePairs(X, N, D, nNB, nMN, nFP, rand, knn, kCand);
   const { offsets, data } = buildCSR(N, pairs);
+  const fpRev = buildFpReverse(N, nFP, pairs.fpFwd);
 
   // [Reference default init is scaled PCA. Gaussian is used here for brevity;
   //  it converges but embeddings will differ run-to-run across seeds.]
@@ -1294,6 +1375,12 @@ export async function pacmapWebGPU(
   const gradBuf = device.createBuffer({ size: N * 2 * 4, usage: S });
   const mBuf = mk(new Float32Array(N * 2), S);
   const vBuf = mk(new Float32Array(N * 2), S);
+  // These two put the gradient shader at 8 storage buffers, which is the
+  // default maxStorageBuffersPerShaderStage — no headroom left. If a ninth is
+  // ever needed, M and V are the ones to interleave: same length, same access
+  // pattern, and adam_main already walks both in lockstep.
+  const fpFwdBuf = mk(pairs.fpFwd, S);
+  const fpRevBuf = mk(fpRev, S);
 
   // One 256-byte-aligned slot per iteration, addressed by dynamic offset.
   // This is what lets the whole loop live in a single command buffer.
@@ -1324,7 +1411,7 @@ export async function pacmapWebGPU(
   const paramBuf = mk(params, GPUBufferUsage.UNIFORM);
 
   // --- Pipelines ---------------------------------------------------------
-  const module = device.createShaderModule({ code: shaderSource(N) });
+  const module = device.createShaderModule({ code: shaderSource(N, nFP) });
 
   const storageEntry = (
     binding: number,
@@ -1348,6 +1435,8 @@ export async function pacmapWebGPU(
         visibility: GPUShaderStage.COMPUTE,
         buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 48 },
       },
+      storageEntry(7, "read-only-storage"),
+      storageEntry(8, "read-only-storage"),
     ],
   });
 
@@ -1374,6 +1463,8 @@ export async function pacmapWebGPU(
       { binding: 4, resource: { buffer: mBuf } },
       { binding: 5, resource: { buffer: vBuf } },
       { binding: 6, resource: { buffer: paramBuf, size: 48 } },
+      { binding: 7, resource: { buffer: fpFwdBuf } },
+      { binding: 8, resource: { buffer: fpRevBuf } },
     ],
   });
 
@@ -1418,7 +1509,10 @@ export async function pacmapWebGPU(
     runRange,
     read,
     destroy() {
-      for (const b of [yBuf, offBuf, adjBuf, gradBuf, mBuf, vBuf, paramBuf]) {
+      for (const b of [
+        yBuf, offBuf, adjBuf, gradBuf, mBuf, vBuf, paramBuf,
+        fpFwdBuf, fpRevBuf,
+      ]) {
         b.destroy();
       }
     },

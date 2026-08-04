@@ -33,15 +33,18 @@ One commit per task, straight to `main`. Both gates after every task:
 
 ## Phase 2 — Local graph adjustment
 
-- [ ] **3. Split FP out of the static CSR (refactor, no new behavior)** — M — deps: 1
+- [x] **3. Split FP out of the static CSR (refactor, no new behavior)** — M — deps: 1
       `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`
-      - [ ] `samplePairs` returns FP partners as a separate `N × n_FP` array
-      - [ ] `buildCSR` takes NB + MN only (tag bits unchanged)
-      - [ ] `FpFwd` + reverse CSR `FpRev` (`[0,N+1)` offsets, then indices) built on the **CPU** for now
-      - [ ] `NbFwd` (`N × n_NB`) emitted for Task 5's reject list
-      - [ ] `grad_main` gains the FP forward + FP reverse loops
-      - [ ] gradient shader at 8 storage buffers; M/V-interleave escape hatch noted in a comment
-      - [ ] A/B against `main` at N=5000, seed 7, `knn: "cpu"` — visually identical
+      - [x] `samplePairs` returns FP partners as a separate `N × n_FP` array
+      - [x] `buildCSR` takes NB + MN only; `T_FP` dropped, only two kinds still packed
+      - [x] `FpFwd` + reverse CSR `FpRev` (`[0,N+1)` offsets, then indices) built on the **CPU** for now
+      - [x] `NbFwd` (`N × n_NB`, short rows padded with `N`) emitted for Task 5's reject list
+      - [x] `grad_main` gains the FP forward + FP reverse loops, sharing one `fpForce`
+      - [x] gradient shader at 8 storage buffers; M/V-interleave escape hatch noted in a comment
+      - [x] A/B **measured headlessly under Dawn**, not by eye: N=800 D=20, seed 7,
+            `knn: "cpu"`, against the pre-refactor bundle from git.
+            iter 1 rel 1.9e-5 · iter 450 rel 2.9e-5 (max|Δ| over layout extent).
+            Gate proven to have teeth: dropping the reverse-FP loop gives rel 0.50.
 
 - [ ] **4. Reverse-CSR rebuild kernels** — M — deps: 3
       `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`
