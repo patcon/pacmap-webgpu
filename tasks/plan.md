@@ -1,259 +1,233 @@
-# Implementation Plan: LocalMAP on WebGPU
+# Implementation Plan: CPU comparison algorithms via DruidJS
 
 ## Context
 
-`src/pacmap-webgpu.ts` implements PaCMAP with the optimizer fully GPU-resident. LocalMAP
-(Wang et al., AAAI 2025) is the same authors' successor, and it ships in the same repo we
-already track as the reference — `YingfanWang/PaCMAP`, `source/pacmap/pacmap.py` lines
-1435–1830. We want it selectable here too.
+The demo offers one implementation of each algorithm — our own WebGPU PaCMAP and LocalMAP,
+selected by the pane's `algorithm` dropdown. There is nothing to check the layouts
+*against*. `check:kernels` proves the kernels compute what a CPU oracle says they should,
+and `check:ab` proves a refactor didn't move the embedding, but neither answers "does this
+look like what an *independent* PaCMAP implementation produces?"
 
-Read against `pacmap()`, LocalMAP is a small delta, entirely inside phase 3:
+DruidJS 0.9.0 ships `PaCMAP` and `LocalMAP` classes — verified in the published tarball
+(`src/dimred/PaCMAP.js`, `src/dimred/LocalMAP.js`), written against the same upstream
+reference we track, `YingfanWang/PaCMAP`. Running them beside ours, in the same viewer,
+over the same PCA output, at the same seed, turns that question into something you can
+scrub through.
 
-1. **Modified NN gradient** (`pacmap_grad_nearby_recip_sqrt`, line 1493). For `itr > n1+n2`
-   the near-pair coefficient is multiplied by `NN_coef_recip / sqrt(d_ij)`, where
-   `NN_coef_recip = low_dist_thres / 2` and `d_ij = 1 + |y_i - y_j|²`. MN and FP
-   coefficients are untouched. Everything else — the weight schedule (`find_weight` is
-   byte-for-byte our `weightsAt`), Adam, the phase split, `n_neighbors`/`MN_ratio`/
-   `FP_ratio` defaults — is identical to PaCMAP.
-2. **Local graph adjustment** (`sample_FP_pair_nearby`, line 1467). At every `itr` with
-   `itr > n1+n2 && itr % 10 == 0`, every point redraws its `n_FP` further partners
-   uniformly at random, rejecting: itself, partners already drawn in this round, its own
-   `n_NB` kNN partners, and any `j` with `‖y_i − y_j‖ > low_dist_thres` **in the
-   embedding**. Up to 100 draws per slot; on exhaustion the previous partner is kept.
-   `low_dist_thres` defaults to 10.
-
-Change 1 is nearly free here. Change 2 is the whole difficulty: it mutates the pair set
-25 times mid-run, and our CSR — with each pair duplicated into both endpoints so the
-gradient kernel can gather instead of scatter (the thing that buys a float-atomic-free
-shader) — is built once on the CPU before the first iteration.
-
-**The intended outcome is that this stays true to the file's organizing constraint: once
-setup finishes, positions never leave GPU memory.** The resample reads `Y`, so it must run
-on the GPU, and the CSR rebuild must run there too. Every kernel below chains into the
-same compute pass as `grad`/`adam`, so `runRange()` remains one command buffer with no
-host round-trip and the demo's banked-frame playback is unaffected.
+Outcome: the `algorithm` dropdown offers four entries — `PaCMAP (GPU - custom)`,
+`LocalMAP (GPU - custom)`, `PaCMAP (CPU - druid)`, `LocalMAP (CPU - druid)` — and all four
+drive the *same* renderer, history buffer, and transport.
 
 ## Architecture Decisions
 
-- **A variant option, not a fork.** `PacmapOptions.variant?: "pacmap" | "localmap"` plus
-  `lowDistThres?: number` (default 10). Upstream `LocalMAP` subclasses `PaCMAP` and reuses
-  its `fit`; mirroring that keeps one setup path, one kNN selection, one pair sampler. A
-  thin `localmapWebGPU(...)` wrapper is exported for API parity.
-- **The modified gradient needs no branch and no new entry point.** Fold it into the
-  existing coefficient as `c = w_NB * 20/(10+dd)² * (A + B·inverseSqrt(dd))`, with
-  `(A,B) = (1,0)` for PaCMAP and every LocalMAP iteration up to `n1+n2`, and
-  `(0, lowDistThres/2)` for LocalMAP's `itr > n1+n2`. `A`/`B` ride in the already-unused
-  `bc.z`/`bc.w` of the per-iteration params slot. One FMA, no divergence, one code path,
-  and `weightsAt()`'s schedule is untouched.
-- **FP moves out of the static CSR.** `buildCSR` keeps only NB and MN pairs (both still
-  duplicated into both endpoints, tag bits unchanged). FP becomes two GPU-resident
-  structures: a fixed `FpFwd` array of `N × n_FP` partner indices, and a rebuilt reverse
-  CSR `FpRev` (`[0, N+1)` = offsets, then `N × n_FP` source indices) in one buffer. The
-  gradient kernel gains two extra loops with the identical FP coefficient — the sign works
-  out exactly as it does for the CSR duplication, since the displacement flips and the
-  scalar (a function of `|d|²`) does not.
-- **The reverse rebuild uses a single-thread serial prefix scan.** `N ≤ 65k` and the chain
-  runs 25 times per run; a serial scan in one invocation is sub-millisecond at that size.
-  A two-level parallel scan would save microseconds and cost a page of WGSL with real
-  correctness subtleties. Same reasoning that makes the demo's bounds reduce a
-  single-workgroup pass.
-- **Reverse lists are sorted so runs stay reproducible.** The scatter uses an atomic
-  cursor, so *which* slot each writer lands in is racy; a final per-point insertion sort
-  over each reverse list removes that. Without it, f32 accumulation order in the gradient
-  would vary run-to-run and LocalMAP would join `nndescentGPU` as a non-deterministic path.
-  We do not want that — `knn: "cpu"` + `variant: "localmap"` must be bit-reproducible.
-- **Storage-buffer budget.** `maxStorageBuffersPerShaderStage` defaults to 8. The gradient
-  shader would go to `Y, Off, Adj, Grad, M, V, FpFwd, FpRev` = exactly 8. If a 9th is ever
-  needed, interleave `M` and `V` into one buffer — same length, same access pattern.
-- **The resample round index must be a dynamic-offset uniform, not a `writeBuffer`.**
-  Queue writes are queue-ordered against the single `submit()`, so 25 pre-submit
-  `writeBuffer` calls would all land before any dispatch and every resample would see the
-  last value. The iteration index goes into the per-iteration params slot instead, which
-  extends it from 32 to 48 bytes (`minBindingSize` 48; the 256-byte alignment already
-  covers it).
+- **The CPU backends present themselves as a `PacmapRun`.** Everything downstream of
+  `pacmapWebGPU()` in `main.ts` — the bounds reduce, the `posHistory`/`boundsHistory`
+  banking, the scrubber, the phase readout — is written against `{ positions, runRange,
+  totalIters, destroy }`. A worker-backed run satisfying that shape reuses all of it. The
+  one concession: `runRange` becomes `void | Promise<void>` and the run loop awaits it.
+  The loop is already `async`, so this is a one-word change and the GPU path is untouched.
+
+- **The invariant survives, in the only form it can.** Positions still never *leave* GPU
+  memory on the render path. The CPU run's `positions` is a real `GPUBuffer`
+  (`STORAGE | VERTEX | COPY_DST | COPY_SRC`) that the worker's snapshot is written *into*
+  via `queue.writeBuffer`. Direction is the whole point — an upload per captured frame,
+  never a `mapAsync` readback — so banking, scrubbing and replay stay exactly as they are.
+
+- **Druid gets the demo's PCA output, not raw pixels.** `pcaProject` already produces the
+  100-d `Z` the GPU path consumes; the worker receives that same array (transferred, not
+  copied) with `apply_pca: false`. Same input, same seed, same `num_iters: [100, 100,
+  250]` ⇒ `totalIters` 450 for every backend, so the history/stride math needs no case.
+
+- **Warn, never block.** Druid's neighbour search is exact O(N²·D) and its optimizer is JS
+  f64, so 65k points is minutes-to-hours. That stays selectable; the cost is surfaced in
+  the existing `~Ns setup` hint, and the run becomes abortable so a long one is
+  recoverable without closing the tab.
+
+- **One expected difference, stated up front.** Druid initializes from a scaled PCA
+  embedding (`PaCMAP.js:515`); ours from a scaled Gaussian, a deviation already documented
+  in `CLAUDE.md`. The two will not converge to the same layout at the same seed and
+  shouldn't be expected to. What is comparable is cluster structure, not orientation.
 
 ## Task List
 
-### Phase 1: LocalMAP gradient, end to end
+### Phase 1: Foundation
 
-#### Task 1: `variant` option and the modified NN coefficient
-**Description:** Add `variant` and `lowDistThres` to `PacmapOptions`, export
-`localmapWebGPU`, extend the params slot from 32 to 48 bytes with the `(A, B)` pair and
-the iteration index, and change one line of `grad_main`'s near-pair branch. Honor the
-reference's strict `itr > n1+n2` (with `(100,100,250)`, the modified gradient starts at
-iteration 201, not 200).
+- [ ] Task 1: Dependency + headless check (`check:druid`)
+
+### Checkpoint: Foundation
+- [ ] `check:druid` green, and demonstrated failing when broken
+
+### Phase 2: The backend
+
+- [ ] Task 2: Worker + adapter, wired end to end
+- [ ] Task 3: Four-way dropdown and the cost hint
+
+### Checkpoint: Core
+- [ ] All four algorithms animate at N=2000
+- [ ] GPU output unchanged from `main` (`check:ab`, no-change control first)
+
+### Phase 3: Polish
+
+- [ ] Task 4: Abort, so a long CPU run is recoverable
+- [ ] Task 5: Document it
+
+### Checkpoint: Complete
+- [ ] `build`, `check:shaders`, `check:kernels`, `check:druid` all clean
+
+---
+
+## Task 1: Dependency + headless check (`check:druid`)
+
+**Description:** Add `@saehrimnir/druidjs` and land the automated gate *first* — it is the
+only check this work gets, and unlike the demo it needs no browser and no Dawn, because
+the druid path is pure CPU JS.
 
 **Acceptance criteria:**
-- [ ] `pacmapWebGPU(..., { variant: "pacmap" })` produces the same embedding as today
-      (`bc.z=1, bc.w=0` at every iteration reduces to the current expression exactly).
-- [ ] `variant: "localmap"` applies `× (lowDistThres/2)·inverseSqrt(dd)` to near pairs
-      only for `it > n1+n2`.
-- [ ] `minBindingSize` updated to 48 in both the layout and `check-shaders.ts`'s
-      `"uniform-dynamic"` case.
+- [ ] `@saehrimnir/druidjs` in `dependencies`; `check:druid` script in `package.json`
+- [ ] `scripts/check-druid.ts` builds a synthetic 4-blob dataset (~400 points, 20-d) and
+      asserts: output is N×2 and finite for both classes; a fixed seed reproduces
+      bit-for-bit; PaCMAP and LocalMAP at one seed differ; two runs differing only in
+      `n_neighbors` differ (this is the assertion that catches a typo'd option name, which
+      druid would otherwise silently ignore); mean intra-blob 2-d distance < inter-blob
+- [ ] Each assertion demonstrated failing before being trusted green
+
+**Verification:**
+- [ ] `npm run check:druid` passes
+- [ ] `npm run build`
+- [ ] Misspell `n_neighbors` in the param object; the params assertion trips
+
+**Dependencies:** None
+**Files:** `package.json`, `scripts/check-druid.ts`
+**Scope:** S
+
+---
+
+## Task 2: Worker + adapter, wired end to end
+
+**Description:** The vertical slice — a CPU run that renders. `src/druid-worker.ts` owns
+the druid instance (no DOM, no GPU); `src/druid-cpu.ts` owns the `GPUBuffer` and hands
+back something `main.ts` already knows how to drive.
+
+Worker protocol, modelled on the reference `druidWorker.ts` (command in, events out, error
+event on throw):
+- `init` — receive transferred `Z` (`Float32Array`, N×100) + params. Widen to
+  `Float64Array[]` row views once. Construct `new druid.PaCMAP(rows, p)` or
+  `new druid.LocalMAP(rows, p)`. Call `check_init()` *explicitly*, so the expensive kNN and
+  pair sampling happens here and can be reported, rather than lazily inside the first step.
+  Hold `gen = dr.generator(450)`. Post `ready`.
+- `step { to }` — pull `gen.next()` until the counter reaches `to`, flatten `dr.Y.values`
+  (flat `Float64Array`, `Matrix.d.ts:445`) into a `Float32Array(N*2)`, post it
+  **transferred**. Only capture boundaries pay the conversion.
+
+Drive `generator()` rather than calling `next()` on the instance: a completed or `break`-ed
+generator releases druid's WASM buffers, a hand-driven `next()` loop does not.
+
+Param mapping, confirmed against the shipped `ParametersPaCMAP` / `ParametersLocalMAP`:
+`n_neighbors`, `MN_ratio`, `FP_ratio`, `seed`, `d: 2`, `num_iters: [100, 100, 250]`,
+`apply_pca: false`, `knn: null`, plus `low_dist_thres` for LocalMAP only.
+
+**Acceptance criteria:**
+- [ ] `druidCPU(device, Z, N, opts): Promise<PacmapRun>` spawns the worker via
+      `new Worker(new URL("./druid-worker.ts", import.meta.url), { type: "module" })`
+- [ ] `runRange(from, to)` posts, awaits the frame, and `writeBuffer`s it — no readback
+- [ ] `destroy()` terminates the worker; worker errors surface through `onStatus`
+- [ ] `PacmapRun.runRange` widened to `void | Promise<void>`; the run loop awaits it
 
 **Verification:**
 - [ ] `npm run build`
-- [ ] `npm run check:shaders`
-- [ ] Manual: run the demo at N=5000 with both variants; LocalMAP shows visibly tighter,
-      better-separated clusters in phase 3.
+- [ ] `?algo=pacmap-cpu` at N=2000 animates and lands on a recognisable digit layout
+- [ ] Scrubbing and replay behave exactly as on the GPU path
 
-**Dependencies:** None. **Scope:** S (`src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`)
+**Dependencies:** Task 1
+**Files:** `src/druid-worker.ts`, `src/druid-cpu.ts`, `src/pacmap-webgpu.ts`, `src/main.ts`
+**Scope:** M
 
-#### Task 2: Demo controls for the variant
-**Description:** Add an `algorithm` dropdown and a `low_dist_thres` slider to the
-`pacmap · next run` folder in `main.ts` (setup-time, so the folder-disabled-while-running
-rule already covers them), seeded from `?algo=localmap` the same way `knnMethod` is seeded
-from `?knn=`. Grey out `low_dist_thres` under `pacmap`. Fold the variant into the status
-line next to the kNN label.
+---
 
-**Acceptance criteria:**
-- [ ] Dropdown switches variant on the next run; `?algo=localmap` preselects it.
-- [ ] `low_dist_thres` slider (range ~2–30, step 0.5, default 10) disabled under `pacmap`.
-- [ ] Folder title and phase readout still accurate for both variants.
+## Task 3: Four-way dropdown and the cost hint
 
-**Verification:** `npm run build`; manual — switch variants and re-run without reload.
-
-**Dependencies:** Task 1. **Scope:** S (`src/main.ts`)
-
-### Checkpoint: Phase 1
-- [ ] `npm run build` and `npm run check:shaders` both clean
-- [ ] Both variants run at N=5000 and N=65000; PaCMAP output unchanged from `main`
-- [ ] Commit (one per task, straight to `main`)
-
-### Phase 2: Local graph adjustment
-
-#### Task 3: Split FP out of the static CSR — refactor, no new behavior
-**Description:** `samplePairs` returns FP partners as a separate `N × n_FP` array (it
-already generates exactly `n_FP` per point in order). `buildCSR` takes NB+MN only. Build
-`FpFwd` and the reverse CSR **on the CPU** for now and upload both. Add the two FP loops
-to `grad_main`. Also emit `NbFwd` (`N × n_NB`, i's own near partners) — the resample
-kernel's reject list in Task 5.
+**Description:** Replace `params.variant: Variant` with `params.algorithm: AlgoKey`
+(`"pacmap-gpu" | "localmap-gpu" | "pacmap-cpu" | "localmap-cpu"`), keeping the
+`Record<string, AlgoKey>` annotation on the options map — that annotation is what makes a
+typo'd *value* a build error rather than a silently wrong run, and it matters more with
+four entries than it did with two.
 
 **Acceptance criteria:**
-- [ ] Embeddings match `main`'s to visual identity at a fixed seed (gradient accumulation
-      order changes, so exact f32 equality is not expected; max coordinate delta should be
-      small relative to the layout's extent).
-- [ ] `FpRev` layout documented at its definition: `[0, N+1)` offsets, then indices.
-- [ ] Gradient shader at 8 storage buffers; the M/V-interleave escape hatch noted in a
-      comment rather than taken.
+- [ ] Labels exactly: `PaCMAP (GPU - custom)`, `LocalMAP (GPU - custom)`,
+      `PaCMAP (CPU - druid)`, `LocalMAP (CPU - druid)`
+- [ ] `?algo=` accepts the four keys; `pacmap`/`localmap` still work as GPU aliases
+- [ ] `go()` branches to `druidCPU` or `pacmapWebGPU` on the derived engine, nothing else
+- [ ] `kNN algo` disabled under a CPU engine (druid runs its own exact search);
+      `low_dist_thres` stays enabled for `localmap-cpu`, which reads it
+- [ ] `estimateSetupSecs` gains a CPU branch; the hint refreshes on dropdown change
 
-**Verification:** `npm run build`; `npm run check:shaders`; manual A/B against `main` at
-N=5000 with `seed: 7`, `knn: "cpu"`.
+**Verification:**
+- [ ] `npm run build`
+- [ ] All four exercised at N=2000; label text matches
+- [ ] Hint jumps by orders of magnitude on switching to a CPU option — at N=65000 it
+      should read in the hours. That number *is* the warning.
 
-**Dependencies:** Task 1. **Scope:** M (`src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`)
+**Dependencies:** Task 2
+**Files:** `src/main.ts`
+**Scope:** S
 
-#### Task 4: The reverse-CSR rebuild kernels
-**Description:** New `fpShaderSource(N, nNB, nFP, lowDistThres)` with the rebuild chain,
-minus the draw itself: `fp_clear` (zero counts), `fp_count` (one thread per point,
-`atomicAdd` on each partner's counter), `fp_scan` (one invocation, serial exclusive prefix
-sum into the offsets region, then reseat the counters as write cursors), `fp_scatter`
-(atomic cursor, write the source index), `fp_sort` (one thread per point, insertion-sort
-its reverse list ascending). Reuse the counter-based `hash3` already in
-`nndShaderSource`. Register in `shaderSources` and add a `check-shaders.ts` case with its
-explicit layout — the CLAUDE.md rule.
+---
 
-**Acceptance criteria:**
-- [ ] Running the chain over the CPU-built `FpFwd` reproduces the CPU-built reverse CSR
-      exactly (verify once via a temporary readback, then delete it).
-- [ ] `fp_sort` makes the reverse list order independent of scatter order.
-- [ ] Every entry point has a pipeline built in `check:shaders`.
+## Task 4: Abort, so a long CPU run is recoverable
 
-**Verification:** `npm run check:shaders` (this is the real gate — nothing here is
-verifiable in a browser until Task 5); one-off readback comparison during development.
-
-**Dependencies:** Task 3. **Scope:** M (`src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`)
-
-#### Task 5: `fp_resample` — the draw itself
-**Description:** One thread per point. For each of `n_FP` slots, up to 100 draws from
-`hash3(seed, i*nFP + slot, round*128 + try) % N`; reject `j == i`, `j` already written to
-a lower slot **this round**, `j` in `NbFwd[i]`, or `dot(y_i − y_j, ·) > lowDistThres²`
-(square the threshold rather than taking a root). On exhaustion, leave the slot's previous
-partner in place. Match the reference's try counter exactly — it increments on *every*
-draw, including self- and duplicate-rejections, and bails at `count > 100`.
+**Description:** With no cap, a 65k CPU run is otherwise only escapable by closing the
+tab. During a run the Start button becomes a Stop that bumps `runGen`, calls
+`pm.destroy()` (terminating the worker), and restores the controls. Cheap, and it is what
+makes "warn, never block" a safe default.
 
 **Acceptance criteria:**
-- [ ] Threshold compared in squared space; `lowDistThres` baked in as a WGSL constant.
-- [ ] Deterministic at a fixed seed (the RNG is counter-based; the round comes from the
-      iteration index in the params slot).
-- [ ] A slot that exhausts its 100 draws keeps its old partner rather than writing garbage
-      or `0`.
+- [ ] Stop is present for every engine, and is the only control enabled mid-run
+- [ ] Stopping a CPU run at N=20000 returns the UI to idle within a frame or two
+- [ ] The last banked frame stays on screen; the transport remains scrubbable over it
 
-**Verification:** `npm run check:shaders`; manual — with `lowDistThres` set very small,
-almost every slot should exhaust and the layout should barely differ from Task 3's.
+**Verification:**
+- [ ] `npm run build`
+- [ ] Start a CPU run at N=20000, stop it mid-flight, start a GPU run — no stale canvas,
+      no orphaned worker (check the browser task manager)
 
-**Dependencies:** Task 4. **Scope:** S (`src/pacmap-webgpu.ts`)
+**Dependencies:** Task 3
+**Files:** `src/main.ts`, `index.html`
+**Scope:** S
 
-#### Task 6: Wire the chain into `runRange`
-**Description:** Under `variant: "localmap"`, for each encoded iteration with
-`it > n1+n2 && it % 10 == 0`, append `fp_resample → fp_clear → fp_count → fp_scan →
-fp_scatter → fp_sort` to the same compute pass, **after** `adam` (matching the reference's
-ordering inside its loop). No barriers needed — WebGPU synchronizes between dispatches in
-a pass. Destroy the new buffers in `destroy()`.
+---
 
-**Acceptance criteria:**
-- [ ] `runRange()` still submits exactly one command buffer and performs no readback.
-- [ ] Under `variant: "pacmap"` not a single FP kernel is encoded, and no FP buffers are
-      allocated beyond `FpFwd`/`FpRev`.
-- [ ] Resampling fires at iterations 210, 220, … 440 for `(100,100,250)` — not at 200.
-- [ ] `destroy()` releases every new buffer.
+## Task 5: Document it
 
-**Verification:** `npm run build`; `npm run check:shaders`; manual — run LocalMAP at
-N=65000, scrub the timeline through phase 3 and watch clusters tighten at the resample
-boundaries; confirm the banked-frame count and MB figure are unchanged from a PaCMAP run
-at the same N.
-
-**Dependencies:** Task 5. **Scope:** S (`src/pacmap-webgpu.ts`)
-
-### Checkpoint: Phase 2
-- [ ] Both automated checks clean
-- [ ] Two runs at a fixed seed with `knn: "cpu"`, `variant: "localmap"` produce identical
-      layouts (reproducibility — the thing `fp_sort` is there for)
-- [ ] LocalMAP at N=65000 completes with no measurable regression in the reported
-      per-iteration time
-
-#### Task 7: Documentation
-**Description:** Update `CLAUDE.md` (a LocalMAP subsection under the CPU/GPU split,
-covering the FP-out-of-CSR change, the serial scan and why, and `fp_sort`'s role in
-reproducibility) and `README.md` (a variant row in "What runs where", the `?algo=` switch,
-and LocalMAP's place among the documented deviations — Gaussian init still applies).
+**Description:** `CLAUDE.md` is the map of this repo; a fourth check and a second engine
+belong in it.
 
 **Acceptance criteria:**
-- [ ] Both files describe the FP split and the resample chain accurately.
-- [ ] The "add a case to `check-shaders.ts` whenever you add a shader" rule reflects the
-      new source.
-- [ ] No speed claims that were not measured.
+- [ ] `check:druid` in the commands block and in the paragraph distinguishing the checks —
+      it sits at a level none of the other three cover (an independent implementation,
+      not our own kernels)
+- [ ] The CPU backend documented with its deviations: PCA init vs our Gaussian, druid's
+      own exact kNN, f64 vs f32, upload-per-frame rather than readback
+- [ ] The LGPL-3.0-or-later note on the dependency
 
-**Verification:** Read back against the final code.
+**Verification:**
+- [ ] `npm run build && npm run check:shaders && npm run check:kernels && npm run check:druid`
 
-**Dependencies:** Task 6. **Scope:** S (`CLAUDE.md`, `README.md`)
+**Dependencies:** Task 4
+**Files:** `CLAUDE.md`
+**Scope:** XS
 
-### Checkpoint: Complete
-- [ ] All acceptance criteria met, seven commits on `main`
+---
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| `fp_sort`'s insertion sort is O(deg²) and a dense-region point could attract a large reverse degree | Med | Reverse degree averages `n_FP` (≈20) and the low-distance filter spreads draws across a neighborhood rather than concentrating them the way kNN hub points do. Measure the phase-3 per-iteration time in Task 6; if it regresses, the documented fallback is to drop `fp_sort` and accept f32-order non-determinism. |
-| 9th storage buffer needed in the gradient shader | Low | Interleave `M` and `V` — same length, same access pattern. Noted in a Task 3 comment. |
-| `low_dist_thres = 10` is calibrated for the reference's PCA init; we use Gaussian init, so the embedding may sit at a different scale in phase 3 | Med | It is a slider, and phase 3 starts after 200 iterations of the same weight schedule, so the scale should be comparable. Compare layouts across `low_dist_thres` values in the Phase 2 checkpoint. |
-| Nothing in phase 2 is verifiable headlessly beyond compilation | Med | `check:shaders` gates every entry point and its real bind-group layout — the failure mode CLAUDE.md warns about (a WGSL error that looks like a plausible blob). The one-off readback in Task 4 checks the rebuild against a CPU-built reference before it goes live. |
+| Druid's per-iteration cost makes even N=2000 sluggish | Med | Measured in Task 1's check before any UI exists; if bad, the hint is the honest answer |
+| Bundling druid's WASM through a Vite worker misbehaves | Med | Task 2 lands the worker alone; druid falls back to a JS neighbour path when WASM is unavailable |
+| LGPL-3.0 dependency in a repo with no LICENSE file | Low | Flagged, not resolved here |
 
-## Verification
+## Open Questions
 
-Run after every task:
-
-```
-npm run build          # tsc --noEmit && vite build
-npm run check:shaders   # compiles all WGSL under Dawn, builds every pipeline
-```
-
-End to end, in a WebGPU browser (`npm run dev`):
-
-1. `?algo=pacmap` at N=5000, seed 7 — output must match `main`'s.
-2. `?algo=localmap` at the same N and seed — clusters tighten and separate in phase 3.
-3. Re-run 2 without changing anything — identical layout (reproducibility).
-4. `?algo=localmap` at N=65000 — completes, timeline scrubs, per-iteration time in the
-   status line comparable to PaCMAP's.
-5. `?knncheck=1` still reports the three kNN backends unchanged (nothing in this plan
-   touches that path).
+- The LGPL-3.0-or-later license on `@saehrimnir/druidjs` is the first copyleft dependency
+  here, and the repo has no LICENSE of its own. Noted for a separate decision; it does not
+  block the work.
