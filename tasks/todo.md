@@ -46,13 +46,19 @@ One commit per task, straight to `main`. Both gates after every task:
             iter 1 rel 1.9e-5 · iter 450 rel 2.9e-5 (max|Δ| over layout extent).
             Gate proven to have teeth: dropping the reverse-FP loop gives rel 0.50.
 
-- [ ] **4. Reverse-CSR rebuild kernels** — M — deps: 3
+- [x] **4. Reverse-CSR rebuild kernels** — M — deps: 3
       `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`
-      - [ ] new `fpShaderSource(N, nNB, nFP, lowDistThres)`
-      - [ ] `fp_clear` / `fp_count` / `fp_scan` (single-invocation serial exclusive scan, then reseat counters as cursors) / `fp_scatter` / `fp_sort`
-      - [ ] `hash3` reused from `nndShaderSource`
-      - [ ] registered in `shaderSources` + a `check-shaders.ts` case with its explicit layout
-      - [ ] one-off readback confirms the chain reproduces the CPU-built reverse CSR exactly, then deleted
+      - [x] new `fpShaderSource(N, nFP)` — **not** the planned
+            `(N, nNB, nFP, lowDistThres)`: those two only serve `fp_resample`, so
+            they arrive with it in Task 5 rather than sitting unused here
+      - [x] `fp_clear` / `fp_count` / `fp_scan` (single-invocation serial exclusive scan, then reseat counters as cursors) / `fp_scatter` / `fp_sort`
+      - [ ] ~~`hash3` reused~~ — belongs to `fp_resample`, moved to Task 5
+      - [x] registered in `shaderSources` + a `check-shaders.ts` case with its explicit layout
+      - [x] chain checked against an **independently written** CPU oracle over 4
+            cases (uniform, hub, empty-lists, ragged-N) — exact match on every
+            word of both regions. Gate proven: an inclusive-vs-exclusive scan
+            fails all 4; skipping `fp_sort` fails 3 of 4, confirming the atomic
+            scatter really is unordered and the sort is load-bearing
 
 - [ ] **5. `fp_resample` — the draw** — S — deps: 4
       `src/pacmap-webgpu.ts`

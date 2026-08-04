@@ -1181,8 +1181,119 @@ function weightsAt(
 export const shaderSources = {
   knnShaderSource,
   nndShaderSource,
+  fpShaderSource,
   shaderSource,
 };
+
+const FP_WG = 64;
+
+/**
+ * Rebuilds the further-pair reverse CSR that `grad_main` gathers from, entirely
+ * on the GPU. LocalMAP redraws the forward pairs every 10 iterations of phase 3
+ * against the *embedding*, so this has to run where Y already lives — reading
+ * positions back 25 times a run to rebuild the structure on the host is exactly
+ * what this library is built not to do.
+ *
+ * The chain is clear -> count -> scan -> scatter -> sort, and it is the GPU
+ * equivalent of `buildFpReverse`, which stays the oracle it was checked against.
+ *
+ * Two notes on the shape it takes:
+ *
+ * - **The scan is one serial invocation.** N is at most a few hundred thousand
+ *   and this runs 25 times a run, so a single thread walking N counters costs a
+ *   fraction of a millisecond. A two-level parallel scan would buy microseconds
+ *   and cost a page of WGSL with real correctness subtleties — the same trade
+ *   the demo's single-workgroup bounds reduce makes.
+ * - **The sort is not decoration.** `fp_scatter` claims slots with an atomic
+ *   cursor, so which writer lands where is a race; sorting each reverse list
+ *   afterwards makes the gradient's f32 summation order reproducible again.
+ *   Without it a fixed seed would stop determining the layout, which is a
+ *   property only `nndescentGPU` is allowed to give up.
+ */
+function fpShaderSource(N: number, nFP: number): string {
+  return /* wgsl */ `
+@group(0) @binding(0) var<storage, read_write> FpF : array<u32>;
+@group(0) @binding(1) var<storage, read_write> FpR : array<u32>;
+@group(0) @binding(2) var<storage, read_write> Cnt : array<atomic<u32>>;
+
+const N   : u32 = ${N}u;
+const NFP : u32 = ${nFP}u;
+// Same two-region layout grad_main reads: [0, N+1) offsets, then the indices.
+const FPR_BASE : u32 = ${N + 1}u;
+
+// FpF is declared read_write because the resample writes it; nothing in this
+// chain does.
+
+@compute @workgroup_size(${FP_WG})
+fn fp_clear(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  atomicStore(&Cnt[i], 0u);
+}
+
+// Reverse degree: how many points drew i. Unlike nnd_reverse there is no cap —
+// the total is exactly N*NFP however it distributes, so the allocation is known
+// in advance and no contribution has to be dropped.
+@compute @workgroup_size(${FP_WG})
+fn fp_count(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  let base = i * NFP;
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) {
+    atomicAdd(&Cnt[FpF[base + s]], 1u);
+  }
+}
+
+// Exclusive prefix sum of the degrees into the offset region, reseating each
+// counter as that point's write cursor on the way past. One invocation, one
+// pass; see the docstring for why this is deliberate rather than lazy.
+@compute @workgroup_size(1)
+fn fp_scan() {
+  var acc : u32 = 0u;
+  for (var i : u32 = 0u; i < N; i = i + 1u) {
+    let c = atomicLoad(&Cnt[i]);
+    FpR[i] = acc;
+    atomicStore(&Cnt[i], acc);
+    acc = acc + c;
+  }
+  FpR[N] = acc;
+}
+
+@compute @workgroup_size(${FP_WG})
+fn fp_scatter(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  let base = i * NFP;
+  for (var s : u32 = 0u; s < NFP; s = s + 1u) {
+    let slot = atomicAdd(&Cnt[FpF[base + s]], 1u);
+    FpR[FPR_BASE + slot] = i;
+  }
+}
+
+// Sorts each reverse list ascending, which is the order the CPU build produces
+// and the order the atomic scatter above destroys. Insertion sort: these lists
+// average NFP entries, and the pass is over a few tens of elements per thread.
+@compute @workgroup_size(${FP_WG})
+fn fp_sort(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= N) { return; }
+  let lo = FpR[i];
+  let hi = FpR[i + 1u];
+
+  for (var a : u32 = lo + 1u; a < hi; a = a + 1u) {
+    let v = FpR[FPR_BASE + a];
+    var b = a;
+    loop {
+      if (b == lo) { break; }
+      if (FpR[FPR_BASE + b - 1u] <= v) { break; }
+      FpR[FPR_BASE + b] = FpR[FPR_BASE + b - 1u];
+      b = b - 1u;
+    }
+    FpR[FPR_BASE + b] = v;
+  }
+}
+`;
+}
 
 function shaderSource(N: number, nFP: number): string {
   return /* wgsl */ `

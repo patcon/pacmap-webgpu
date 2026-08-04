@@ -104,6 +104,26 @@ const cases: Case[] = [
     },
   },
   {
+    name: "fp-rebuild",
+    code: shaderSources.fpShaderSource(N, NFP),
+    build: (device, module) => {
+      // One layout across all five entry points, for the same reason
+      // NN-Descent declares its own: `layout: "auto"` derives a narrower one
+      // per entry point (fp_clear never touches FpF or FpR), and a single
+      // shared bind group would then fail validation against it.
+      const layout = computeLayout(device, ["storage", "storage", "storage"]);
+      for (const entryPoint of [
+        "fp_clear",
+        "fp_count",
+        "fp_scan",
+        "fp_scatter",
+        "fp_sort",
+      ]) {
+        device.createComputePipeline({ layout, compute: { module, entryPoint } });
+      }
+    },
+  },
+  {
     name: "pacmap",
     code: shaderSources.shaderSource(N, NFP),
     build: (device, module) => {
