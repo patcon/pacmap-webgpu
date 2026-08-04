@@ -101,12 +101,21 @@ One commit per task, straight to `main`. Both gates after every task:
 - [ ] Two LocalMAP runs at fixed seed + `knn: "cpu"` give identical layouts (reproducibility)
 - [ ] N=65000 completes with no measurable per-iteration regression
 
-- [ ] **7. Documentation** — S — deps: 6
+- [x] **7. Documentation** — S — deps: 6
       `CLAUDE.md`, `README.md`
-      - [ ] LocalMAP subsection: FP-out-of-CSR, the serial scan and why, `fp_sort`'s role
-      - [ ] README: variant row in "What runs where", `?algo=` switch, deviations
-      - [ ] the "add a `check-shaders.ts` case per shader" rule covers the new source
-      - [ ] no unmeasured speed claims
+      - [x] LocalMAP subsection: FP-out-of-CSR, the serial scan and why, `fp_sort`'s role,
+            the resample's draw-budget deviation
+      - [x] README: "Two algorithms" section, row in "What runs where", `?algo=` switch,
+            caveat for the draw budget
+      - [x] "five WGSL sources" → six; `T_NB`/`T_MN` only; pane folder retitled
+      - [x] CLAUDE.md now records that the Dawn harness measures behavior, not just
+            compilation, plus the three traps in rebuilding it
+      - [x] no unmeasured speed claims — LocalMAP's runtime cost is called out as
+            explicitly **unmeasured** rather than assumed negligible
+      - [x] facts checked against the code, not memory: 24 fires (210…440), 6 shaders,
+            `MAX_TRIES` 100, `lowDistThres` default 10, upstream `localmap()` at 1542.
+            Corrected my own `(thres/2)/|d|` → `(thres/2)/√(1+|d|²)`, which is what
+            `inverseSqrt(dd)` actually computes and does not blow up at d=0.
 
 ### ✅ Checkpoint: Complete
 - [ ] All acceptance criteria met, seven commits on `main`
