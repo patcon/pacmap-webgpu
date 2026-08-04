@@ -1507,17 +1507,32 @@ fn adam_main(@builtin(global_invocation_id) gid : vec3<u32>) {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export interface PacmapRun {
+/**
+ * What a consumer needs to drive an embedding to completion and draw it.
+ *
+ * The surface `main.ts` binds its renderer, bounds reduce and playback history
+ * against, so anything satisfying it can be animated by the demo — including a
+ * CPU implementation that computes off-thread and uploads (see `druid-cpu.ts`).
+ * Stepping is therefore allowed to be asynchronous here; `PacmapRun` below
+ * narrows that back to synchronous for the GPU path, which never awaits.
+ */
+export interface EmbeddingRun {
   /** N x 2 f32 positions. Bindable as a vertex buffer for zero-copy rendering. */
   positions: GPUBuffer;
+  run(): void | Promise<void>;
+  runRange(from: number, to: number): void | Promise<void>;
+  read(): Promise<Float32Array>;
+  totalIters: number;
+  destroy(): void;
+}
+
+export interface PacmapRun extends EmbeddingRun {
   /** Encode and submit the full optimization. No host round-trip inside. */
   run(): void;
   /** Encode iterations [from, to) only — for stepping an animation. */
   runRange(from: number, to: number): void;
   /** Copy positions back to the host. */
   read(): Promise<Float32Array>;
-  totalIters: number;
-  destroy(): void;
 }
 
 export async function pacmapWebGPU(

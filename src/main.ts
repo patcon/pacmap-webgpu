@@ -4,8 +4,9 @@ import {
   knnGPU,
   nndescentGPU,
   defaultNeighbors,
-  type PacmapRun,
+  type EmbeddingRun,
 } from "./pacmap-webgpu";
+import { druidCPU } from "./druid-cpu";
 import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
 import { boundsWGSL, renderWGSL } from "./shaders";
@@ -32,20 +33,28 @@ const status = (m: string) => (statusEl.textContent = m);
 
 // ---------------------------------------------------------------------------
 // URL switches
-//   ?algo=localmap  run LocalMAP rather than PaCMAP (default pacmap)
-//   ?knn=gpu|nnd    pick the kNN backend (default cpu brute force)
-//   ?knncheck=1     run every backend over one input and report how they compare
+//   ?algo=localmap          run LocalMAP rather than PaCMAP (default pacmap)
+//   ?algo=pacmap-cpu        run DruidJS on the CPU rather than our WGSL
+//   ?knn=gpu|nnd            pick the kNN backend (default cpu brute force)
+//   ?knncheck=1             run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
 type KnnMode = "gpu" | "cpu" | "nndescent";
 type Variant = "pacmap" | "localmap";
+/** Which implementation runs the optimizer: our WGSL, or DruidJS off-thread. */
+type Engine = "gpu" | "cpu";
 
 const qs = new URLSearchParams(location.search);
 const KNN_MODE: KnnMode =
   qs.get("knn") === "gpu" ? "gpu"
   : qs.get("knn") === "nnd" || qs.get("knn") === "nndescent" ? "nndescent"
   : "cpu";
-const ALGO_MODE: Variant = qs.get("algo") === "localmap" ? "localmap" : "pacmap";
+// `pacmap` / `localmap` stay valid and mean the GPU implementations, which is
+// what they meant before there was a second one.
+const ALGO_PARAM = qs.get("algo") ?? "";
+const ALGO_MODE: Variant =
+  ALGO_PARAM.startsWith("localmap") ? "localmap" : "pacmap";
+const ENGINE_MODE: Engine = ALGO_PARAM.endsWith("-cpu") ? "cpu" : "gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
 
 // Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
@@ -108,26 +117,44 @@ async function go() {
 
     if (KNN_CHECK) await knnSelfCheck(device, Z, N);
 
-    const knnLabel = KNN_LABELS[params.knnMethod];
     // Read once, here: the folder is disabled for the duration of the run, so
     // these are the values this run is committed to.
     const variant = params.variant;
+    const engine = params.engine;
     const algoLabel = ALGO_LABELS[variant];
+    // Druid runs its own exact neighbour search, so the kNN backend is a
+    // GPU-engine concept and naming one under the CPU engine would be a lie.
+    const knnLabel = engine === "cpu" ? "druid exact" : KNN_LABELS[params.knnMethod];
+    const nNeighbors = params.autoNeighbors ? undefined : params.nNeighbors;
+
     status(
       `PCA ${tPca | 0}ms · building kNN graph (${knnLabel}) + sampling pairs…`
     );
     await frame();
     const t1 = performance.now();
-    const pm: PacmapRun = await pacmapWebGPU(device, Z, N, 100, {
-      seed: params.seed,
-      knn: params.knnMethod,
-      variant,
-      lowDistThres: params.lowDistThres,
-      nNeighbors: params.autoNeighbors ? undefined : params.nNeighbors,
-      mnRatio: params.mnRatio,
-      fpRatio: params.fpRatio,
-      onStatus: status,
-    });
+    const pm: EmbeddingRun =
+      engine === "cpu"
+        ? await druidCPU(device, Z, N, 100, {
+            variant,
+            seed: params.seed,
+            lowDistThres: params.lowDistThres,
+            // Druid has no equivalent of the library's log10(N) rule, so "auto"
+            // is resolved here rather than passed through as undefined.
+            nNeighbors: nNeighbors ?? defaultNeighbors(N),
+            mnRatio: params.mnRatio,
+            fpRatio: params.fpRatio,
+            onStatus: status,
+          })
+        : await pacmapWebGPU(device, Z, N, 100, {
+            seed: params.seed,
+            knn: params.knnMethod,
+            variant,
+            lowDistThres: params.lowDistThres,
+            nNeighbors,
+            mnRatio: params.mnRatio,
+            fpRatio: params.fpRatio,
+            onStatus: status,
+          });
     const tSetup = performance.now() - t1;
 
     // --- Render resources --------------------------------------------------
@@ -348,7 +375,9 @@ async function go() {
     while (it < pm.totalIters) {
       for (let c = 0; c < chunks && it < pm.totalIters; c++) {
         const next = Math.min(it + stride, pm.totalIters);
-        pm.runRange(it, next); // optimizer steps stay entirely on the GPU
+        // Awaited for the CPU engine, where a step is a worker round-trip. The
+        // GPU path returns void and resolves immediately, exactly as before.
+        await pm.runRange(it, next);
         it = next;
         slot++;
         frameIters[slot] = it;
@@ -474,6 +503,9 @@ const params = {
   // shouldn't need a reload.
   knnMethod: KNN_MODE,
   variant: ALGO_MODE,
+  // Not in the pane yet — the four-way dropdown that exposes it is the next
+  // change. Until then `?algo=pacmap-cpu` is how you reach the CPU engine.
+  engine: ENGINE_MODE as Engine,
   // Upstream's default. Only read under localmap.
   lowDistThres: 10,
 };

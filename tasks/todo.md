@@ -31,21 +31,36 @@ scrambled layout scoring 1.004 — the gate has room on both sides.
 
 ## Phase 2 — The backend
 
-- [ ] **2. Worker + adapter, wired end to end** — M — deps: 1
-      `src/druid-worker.ts`, `src/druid-cpu.ts`, `src/pacmap-webgpu.ts`, `src/main.ts`
-      - [ ] Worker: `init` widens `Z` to `Float64Array[]` rows, constructs the class,
-            calls `check_init()` explicitly, holds `generator(450)`, posts `ready`
-      - [ ] Worker: `step { to }` pulls to `to`, flattens `dr.Y.values` → `Float32Array`,
+- [x] **2. Worker + adapter, wired end to end** — M — deps: 1
+      `src/druid-protocol.ts`, `src/druid-worker.ts`, `src/druid-cpu.ts`,
+      `src/pacmap-webgpu.ts`, `src/main.ts`, `scripts/check-druid.ts`
+      - [x] Worker: `init` builds a **`Matrix`** (not `Float64Array[]` — see below),
+            constructs the class, calls `check_init()` explicitly, holds
+            `generator(450)`, posts `ready`
+      - [x] Worker: `step { to }` pulls to `to`, flattens `dr.Y.values` → `Float32Array`,
             posts it **transferred**
-      - [ ] Worker: drives `generator()`, not bare `next()` — that is what releases the
+      - [x] Worker: drives `generator()`, not bare `next()` — that is what releases the
             WASM buffers
-      - [ ] Params mapped: `n_neighbors`, `MN_ratio`, `FP_ratio`, `seed`, `d: 2`,
-            `num_iters: [100,100,250]`, `apply_pca: false`, `knn: null`,
-            `low_dist_thres` for LocalMAP only
-      - [ ] `druidCPU()` owns a `STORAGE | VERTEX | COPY_DST | COPY_SRC` buffer;
+      - [x] Params mapped in `druid-protocol.ts`, shared with the check so a typo there
+            fails CI rather than the browser
+      - [x] `druidCPU()` owns a `STORAGE | VERTEX | COPY_DST | COPY_SRC` buffer;
             `runRange` uploads via `writeBuffer` — never a readback
-      - [ ] `PacmapRun.runRange` widened to `void | Promise<void>`; run loop awaits
-      - [ ] `destroy()` terminates the worker; worker errors reach `onStatus`
+      - [x] `EmbeddingRun` added as the async-capable supertype; `PacmapRun` extends it
+            and re-narrows to `void`, so the GPU contract is unchanged rather than
+            widened (deviation from the plan, which said to widen `PacmapRun` itself)
+      - [x] Run loop awaits `pm.runRange(...)`
+      - [x] `destroy()` terminates the worker; worker `onerror`/`onmessageerror`/thrown
+            errors all reach `onStatus` instead of hanging the first await
+      - [x] `?algo=pacmap-cpu` / `?algo=localmap-cpu` select the engine; bare
+            `pacmap`/`localmap` still mean the GPU pair
+
+**Two findings worth keeping.** Druid's `generator()` yields `this.projection`, and
+for a `Float64Array[]` input that getter calls `to2dArray()` — N fresh arrays on
+every one of the 450 iterations, all discarded, ~29M allocations at 65k. Passing a
+`Matrix` makes `projection` return `this.Y` by reference. And `check:druid` now
+proves the two decisions this rests on are behaviour-preserving:
+`worker/chunked-generator-matches-transform` (uneven strides, bit-for-bit against
+`transform()`) and `worker/matrix-input-matches-rows`.
 
 - [ ] **3. Four-way dropdown and the cost hint** — S — deps: 2
       `src/main.ts`

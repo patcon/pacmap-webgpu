@@ -25,7 +25,8 @@
  * JS, so it runs anywhere Node does. Run with `npm run check:druid`.
  */
 
-import { LocalMAP, PaCMAP } from "@saehrimnir/druidjs";
+import { LocalMAP, Matrix, PaCMAP } from "@saehrimnir/druidjs";
+import { buildDruidParams } from "../src/druid-protocol";
 
 let failures = 0;
 let checks = 0;
@@ -107,17 +108,17 @@ interface RunOpts {
 
 /** One embedding, flattened to the N x 2 f32 the GPU buffer would receive. */
 function embed(o: RunOpts): { Y: Float32Array; ms: number } {
-  const params = {
-    n_neighbors: o.n_neighbors ?? 10,
-    MN_ratio: 0.5,
-    FP_ratio: 2.0,
-    d: 2,
-    num_iters: [100, 100, 250],
-    apply_pca: false,
-    knn: null,
+  // The real mapping, the one the worker ships — so a typo there fails the
+  // behavioural checks below, not just the key-set check.
+  const params = buildDruidParams({
+    variant: o.variant,
+    nNeighbors: o.n_neighbors ?? 10,
+    mnRatio: 0.5,
+    fpRatio: 2.0,
+    lowDistThres: 10,
     seed: o.seed ?? SEED,
-    ...(o.variant === "localmap" ? { low_dist_thres: 10 } : {}),
-  };
+    phases: [100, 100, 250],
+  });
 
   const t0 = performance.now();
   const dr =
@@ -195,7 +196,173 @@ function structurePreserved(name: string, Y: Float32Array): void {
   );
 }
 
+/**
+ * Every key `buildDruidParams` may emit, transcribed by hand from druid's
+ * shipped `ParametersPaCMAP` / `ParametersLocalMAP` declarations.
+ *
+ * Written out here rather than derived from `DruidParams` on purpose. If this
+ * list were computed from the same source the builder uses, a misspelling would
+ * appear identically on both sides and cancel out — the exact way an oracle
+ * that shares code with its subject fails to catch anything. Transcribing it
+ * independently is what gives the comparison teeth.
+ */
+const EXPECTED_KEYS = [
+  "MN_ratio",
+  "FP_ratio",
+  "apply_pca",
+  "d",
+  "knn",
+  "low_dist_thres",
+  "n_neighbors",
+  "num_iters",
+  "seed",
+];
+
+/**
+ * The keys the worker sends are keys druid declares.
+ *
+ * This is the check that covers the *worker's* mapping. The behavioural checks
+ * further down can only see parameters that change the layout; a mis-typed
+ * `apply_pca` or `num_iters` would sail past them, because druid would fall
+ * back to a default that still produces a sane embedding.
+ */
+function paramKeysAreReal(): void {
+  const pacKeys = Object.keys(
+    buildDruidParams({
+      variant: "pacmap",
+      nNeighbors: 10,
+      mnRatio: 0.5,
+      fpRatio: 2,
+      lowDistThres: 10,
+      seed: SEED,
+      phases: [100, 100, 250],
+    })
+  ).sort();
+  const lmKeys = Object.keys(
+    buildDruidParams({
+      variant: "localmap",
+      nNeighbors: 10,
+      mnRatio: 0.5,
+      fpRatio: 2,
+      lowDistThres: 10,
+      seed: SEED,
+      phases: [100, 100, 250],
+    })
+  ).sort();
+
+  const unknown = lmKeys.filter((k) => !EXPECTED_KEYS.includes(k));
+  check(
+    "params/keys-are-declared-by-druid",
+    unknown.length === 0,
+    `druid declares no such parameter: ${unknown.join(", ")}`
+  );
+
+  // Everything except low_dist_thres, which druid's PaCMAP does not declare.
+  const wanted = EXPECTED_KEYS.filter((k) => k !== "low_dist_thres");
+  const missing = wanted.filter((k) => !pacKeys.includes(k));
+  check(
+    "params/pacmap-sends-every-key",
+    missing.length === 0 && !pacKeys.includes("low_dist_thres"),
+    missing.length
+      ? `never sent: ${missing.join(", ")}`
+      : "low_dist_thres sent under pacmap, which druid does not declare there"
+  );
+
+  check(
+    "params/localmap-adds-low-dist-thres",
+    lmKeys.includes("low_dist_thres"),
+    "LocalMAP's only extra parameter is never sent"
+  );
+
+  // The two engines must agree on iteration count or the demo's history stride
+  // arithmetic diverges between them.
+  const p = buildDruidParams({
+    variant: "pacmap",
+    nNeighbors: 10,
+    mnRatio: 0.5,
+    fpRatio: 2,
+    lowDistThres: 10,
+    seed: SEED,
+    phases: [100, 100, 250],
+  });
+  check(
+    "params/iterations-match-the-gpu-path",
+    p.num_iters.reduce((a, b) => a + b, 0) === 450 && p.apply_pca === false,
+    `num_iters ${JSON.stringify(p.num_iters)}, apply_pca ${p.apply_pca}`
+  );
+}
+
+/**
+ * The two things `druid-worker.ts` does differently from `embed` above, checked
+ * where a browser is not needed to see them.
+ *
+ * The worker cannot call `transform()`: the demo animates, so it drives
+ * `generator()` and pulls it forward a chunk at a time, reading the embedding
+ * only on capture boundaries. And it hands druid a `Matrix` rather than
+ * `Float64Array[]`, because druid's `projection` getter copies via
+ * `to2dArray()` for the array forms and would do so on every one of the 450
+ * iterations.
+ *
+ * Both are performance decisions, and both would be silent if wrong — a chunked
+ * run that diverged from a straight one, or a Matrix input that took a different
+ * path through druid, would still produce a plausible layout. So: same seed,
+ * same params, all three routes, bit-for-bit.
+ */
+function workerDrivingIsEquivalent(): void {
+  const params = buildDruidParams({
+    variant: "pacmap",
+    nNeighbors: 10,
+    mnRatio: 0.5,
+    fpRatio: 2.0,
+    lowDistThres: 10,
+    seed: SEED,
+    phases: [100, 100, 250],
+  });
+
+  const asMatrix = () => new Matrix(N, D, (i, j) => rows[i][j]);
+  const flatten = (v: Float64Array) => {
+    const Y = new Float32Array(N * 2);
+    for (let k = 0; k < Y.length; k++) Y[k] = v[k];
+    return Y;
+  };
+
+  // Straight through, Matrix in.
+  const whole = new PaCMAP(asMatrix(), params);
+  whole.transform();
+  const straight = flatten(whole.Y.values);
+
+  // Chunked exactly as the worker drives it — deliberately an uneven stride, so
+  // a boundary assumption baked into druid would show up.
+  const stepped = new PaCMAP(asMatrix(), params);
+  stepped.check_init();
+  const steps = stepped.generator(450);
+  let it = 0;
+  for (const to of [37, 100, 101, 250, 449, 450]) {
+    while (it < to) {
+      if (steps.next().done) break;
+      it++;
+    }
+  }
+  check(
+    "worker/chunked-generator-matches-transform",
+    it === 450 && identical(straight, flatten(stepped.Y.values)),
+    `stopped at iteration ${it}`
+  );
+
+  // Matrix input against the row input every other check here uses, so those
+  // checks keep speaking about the same computation the worker runs.
+  const viaRows = new PaCMAP(rows, params);
+  viaRows.transform();
+  check(
+    "worker/matrix-input-matches-rows",
+    identical(straight, flatten(viaRows.Y.values))
+  );
+}
+
 function main(): number {
+  paramKeysAreReal();
+  workerDrivingIsEquivalent();
+
   const pac = embed({ variant: "pacmap" });
   const lm = embed({ variant: "localmap" });
 
