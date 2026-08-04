@@ -34,6 +34,17 @@ export interface DruidCpuOptions {
   seed?: number;
   /** Iterations per phase. Default [100, 100, 250], matching the GPU path. */
   phases?: [number, number, number];
+  /**
+   * Kills the worker, including part way through setup.
+   *
+   * That last part is the reason this exists rather than the caller simply
+   * declining to step: druid's neighbour search is one synchronous call that
+   * owns the worker for the entire time — minutes, at the top of the range —
+   * so there is no point in it where a cooperative check could run.
+   * `terminate()` is the only thing that stops it, and without this the demo's
+   * stop button would be inert during the longest phase of the run.
+   */
+  signal?: AbortSignal;
   onStatus?: (msg: string) => void;
 }
 
@@ -98,6 +109,18 @@ export async function druidCPU(
     fail(new Error(`druid worker failed to load: ${e.message}`));
   worker.onmessageerror = () => fail(new Error("druid worker: uncloneable message"));
 
+  // Wired before the first message so an abort during setup is caught. `fail`
+  // also rejects whatever request is outstanding, which is what unblocks the
+  // caller's await rather than leaving it pending forever.
+  const onAbort = () => {
+    worker.terminate();
+    fail(new Error("aborted"));
+  };
+  if (opts.signal) {
+    if (opts.signal.aborted) onAbort();
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+  }
+
   function request(cmd: DruidCommand, transfer: Transferable[] = []) {
     return new Promise<DruidEvent>((resolve, reject) => {
       if (dead) return reject(dead);
@@ -160,6 +183,7 @@ export async function druidCPU(
     runRange,
     read: async () => last,
     destroy() {
+      opts.signal?.removeEventListener("abort", onAbort);
       worker.terminate();
       positions.destroy();
     },

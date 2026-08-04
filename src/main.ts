@@ -104,12 +104,23 @@ let running = false;
 // Bumped on every run so a previous run's render loop and resize handler stop
 // touching the canvas (their buffers belong to a device that is now stale).
 let runGen = 0;
+/**
+ * Aborts the run in flight.
+ *
+ * The CPU engine can occupy the machine for minutes, and before this the only
+ * way out was closing the tab — which is what made "warn, never block" a safe
+ * default rather than a trap. Held at module scope because the button that
+ * triggers it lives here too, outside any one run.
+ */
+let runAbort: AbortController | null = null;
 
 async function go() {
   if (running) return;
   running = true;
-  startBtn.disabled = true;
+  startBtn.textContent = "Stop";
   const gen = ++runGen;
+  const abort = new AbortController();
+  runAbort = abort;
   resetTransport();
   pacmapFolder.disabled = true; // setup-time params; this run is committed
 
@@ -138,6 +149,11 @@ async function go() {
     });
     const tPca = performance.now() - t0;
 
+    // PCA is the one long stretch neither engine can interrupt — it runs on
+    // this thread, yielding only to paint. A stop during it is honoured here,
+    // before committing to a setup that is itself minutes long on the CPU.
+    if (abort.signal.aborted) throw new Error("aborted");
+
     if (KNN_CHECK) await knnSelfCheck(device, Z, N);
 
     // Read once, here: the folder is disabled for the duration of the run, so
@@ -160,6 +176,7 @@ async function go() {
       engine === "cpu"
         ? await druidCPU(device, Z, N, 100, {
             variant,
+            signal: abort.signal,
             seed: params.seed,
             lowDistThres: params.lowDistThres,
             // Druid has no equivalent of the library's log10(N) rule, so "auto"
@@ -392,16 +409,35 @@ async function go() {
     const chunks = Math.max(1, Math.round(stepsPerFrame / stride));
     let it = 0;
     let slot = 0;
+    // How many frames the trace actually holds. Equal to the planned
+    // `frameCount` while the run is in flight and for any run that finishes;
+    // narrowed below when a stop cuts the trace short. Declared here because
+    // `setReadout` reads it from inside the loop.
+    let banked = frameCount;
     frameIters[0] = 0;
     captureAndDraw(0); // the Gaussian init, before any optimizer step
 
     const tOpt = performance.now();
-    while (it < pm.totalIters) {
-      for (let c = 0; c < chunks && it < pm.totalIters; c++) {
+    while (it < pm.totalIters && !abort.signal.aborted) {
+      for (
+        let c = 0;
+        c < chunks && it < pm.totalIters && !abort.signal.aborted;
+        c++
+      ) {
         const next = Math.min(it + stride, pm.totalIters);
-        // Awaited for the CPU engine, where a step is a worker round-trip. The
-        // GPU path returns void and resolves immediately, exactly as before.
-        await pm.runRange(it, next);
+        try {
+          // Awaited for the CPU engine, where a step is a worker round-trip.
+          // The GPU path returns void and resolves immediately, as before.
+          await pm.runRange(it, next);
+        } catch (e) {
+          // Stopping mid-step terminates the worker, which rejects the request
+          // this is awaiting. Everything banked before it is still a valid
+          // trace, so break to the playback below rather than throwing past it
+          // into the error path — the frames are the point of having stopped
+          // rather than reloaded.
+          if (abort.signal.aborted) break;
+          throw e;
+        }
         it = next;
         slot++;
         frameIters[slot] = it;
@@ -413,29 +449,49 @@ async function go() {
     }
     const elapsed = performance.now() - tOpt;
 
-    const mb = ((frameCount * frameBytes) / (1 << 20)).toFixed(0);
+    // A stopped run keeps everything it banked. The trace is shorter than the
+    // schedule, so playback is bounded by what exists rather than by
+    // `frameCount`, and the frames themselves are as valid as any other.
+    const stopped = abort.signal.aborted;
+    banked = slot + 1;
+
+    // On a stop, this is what kills the druid worker — the whole point of the
+    // button. Replay reads `posHistory`/`boundsHistory`, which are owned here
+    // and outlive it, so the banked trace survives the teardown.
+    //
+    // Deliberately not done for a run that finished: that path is unchanged
+    // from before this button existed, and it is the one someone is looking at
+    // when the layout settles. Freeing there would be a real improvement — the
+    // run's buffers currently live until the next run replaces them — but it is
+    // a change to the main path that wants a browser to confirm, and this
+    // change could not get one.
+    if (stopped) pm.destroy();
+
+    const mb = ((banked * frameBytes) / (1 << 20)).toFixed(0);
     status(
       `${N} points · ${algoLabel} · PCA ${tPca | 0}ms · ` +
         `kNN+pairs ${tSetup | 0}ms (${knnLabel}) · ` +
-        `${pm.totalIters} iters in ${elapsed | 0}ms ` +
-        `(${(elapsed / pm.totalIters).toFixed(2)}ms/iter, includes render + rAF) · ` +
-        `${frameCount} frames banked on the GPU (${mb}MB` +
+        `${stopped ? `stopped at ${it} of ${pm.totalIters}` : `${pm.totalIters}`} ` +
+        `iters in ${elapsed | 0}ms ` +
+        `(${(elapsed / Math.max(it, 1)).toFixed(2)}ms/iter, includes render + rAF) · ` +
+        `${banked} frames banked on the GPU (${mb}MB` +
         `${stride > 1 ? `, every ${stride}th iter` : ""})`
     );
 
     // --- Playback ----------------------------------------------------------
-    playhead = frameCount - 1;
+    scrub.max = String(banked - 1);
+    playhead = banked - 1;
     setPlaying(false);
     playBtn.disabled = false;
     scrub.disabled = false;
     onSeek = (f) => {
-      playhead = Math.max(0, Math.min(f, frameCount - 1));
+      playhead = Math.max(0, Math.min(f, banked - 1));
       scrub.value = String(playhead);
       setReadout(playhead);
     };
     onPlayToggle = () => {
       // Restarting from the top at the end is what a player is expected to do.
-      if (!playing && playhead >= frameCount - 1) onSeek!(0);
+      if (!playing && playhead >= banked - 1) onSeek!(0);
       setPlaying(!playing);
     };
     setReadout(playhead);
@@ -452,7 +508,7 @@ async function go() {
         : iter <= 200 ? "2 · local refine"
         : variant === "localmap" ? "3 · attract-repel + local graph"
         : "3 · attract-repel";
-      readoutEl.textContent = `frame ${f + 1} / ${frameCount}`;
+      readoutEl.textContent = `frame ${f + 1} / ${banked}`;
     }
 
     // Keeps drawing after convergence so resizing still works, and advances the
@@ -464,8 +520,8 @@ async function go() {
       last = now;
       if (playing) {
         const next = playhead + dt * PLAYBACK_FPS;
-        if (next >= frameCount - 1) {
-          onSeek!(frameCount - 1);
+        if (next >= banked - 1) {
+          onSeek!(banked - 1);
           setPlaying(false);
         } else {
           onSeek!(next);
@@ -477,11 +533,18 @@ async function go() {
     };
     requestAnimationFrame(tick);
   } catch (e) {
-    status(`Error: ${(e as Error).message}`);
-    console.error(e);
+    // A stop during setup surfaces here, as the rejection of whatever the run
+    // was awaiting. It is a request that was granted, not a failure.
+    if (abort.signal.aborted) {
+      status("Stopped before the first iteration — nothing to replay.");
+    } else {
+      status(`Error: ${(e as Error).message}`);
+      console.error(e);
+    }
   } finally {
     running = false;
-    startBtn.disabled = false;
+    runAbort = null;
+    startBtn.textContent = "Run";
     sampleSel.disabled = false;
     pacmapFolder.disabled = false;
   }
@@ -917,4 +980,9 @@ PALETTE.forEach((c, i) => {
   legend.appendChild(s);
 });
 
-startBtn.addEventListener("click", go);
+// One button, two jobs. A run that can take minutes needs a way out that is
+// where you already are — and the only alternative was closing the tab.
+startBtn.addEventListener("click", () => {
+  if (running) runAbort?.abort();
+  else void go();
+});

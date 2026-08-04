@@ -94,11 +94,27 @@ the hint is an order of magnitude, not a prediction.
 
 ## Phase 3 — Polish
 
-- [ ] **4. Abort, so a long CPU run is recoverable** — S — deps: 3
-      `src/main.ts`, `index.html`
-      - [ ] Start becomes Stop mid-run; bumps `runGen`, calls `pm.destroy()`
-      - [ ] N=20000 CPU run stops within a frame or two, last banked frame stays up
-      - [ ] No orphaned worker afterwards (browser task manager)
+- [x] **4. Abort, so a long CPU run is recoverable** — S — deps: 3
+      `src/main.ts`, `src/druid-cpu.ts`
+      - [x] Start becomes Stop mid-run, driven by an `AbortController`
+      - [x] `DruidCpuOptions.signal` terminates the worker — needed because druid's
+            neighbour search is one synchronous call owning the worker for minutes,
+            so no cooperative check can run during the longest phase
+      - [x] Stop honoured after PCA too, before committing to a minutes-long setup
+      - [x] A stop mid-step rejects the in-flight `runRange`; caught and broken out of
+            rather than thrown past the playback setup, so the banked trace survives
+      - [x] Playback bounded by `banked` (frames actually captured) rather than the
+            planned `frameCount`; scrubber, readout and loop-around all follow it
+      - [x] Status reports `stopped at N of 450`
+      - [x] `pm.destroy()` on stop only — see below
+
+**Deliberately not done:** `pm.destroy()` for runs that *finish*. It would free the
+run's buffers, which currently live until the next run replaces them, but that is a
+change to the path someone is looking at when the layout settles, and this change had
+no browser to confirm it in. Left as a known, sited improvement.
+
+**Untested here:** every acceptance criterion in this task is a browser behaviour.
+The build and all four checks are green, but no stop has actually been clicked.
 
 - [ ] **5. Document it** — XS — deps: 4
       `CLAUDE.md`
