@@ -31,9 +31,9 @@ jobs:
         with:
           path: dist
 
-  # Runs alongside build rather than gating it: a WGSL regression should be
+  # Runs alongside build rather than gating it: a kernel regression should be
   # reported, but it can't break a page that tsc and vite already accepted.
-  shaders:
+  gpu:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,8 +55,11 @@ jobs:
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
       - if: steps.modules.outputs.cache-hit != 'true'
         run: npm ci
-      # --strict: no adapter is a broken runner, not a reason to pass quietly.
+      # --strict on both: no adapter is a broken runner, not a reason to pass
+      # quietly. Shaders first — every kernel check would fail for the same
+      # reason if a module stopped compiling, and that message is the useful one.
       - run: npm run check:shaders -- --strict
+      - run: npm run check:kernels -- --strict
 
   deploy:
     needs: build

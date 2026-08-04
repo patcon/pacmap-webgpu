@@ -10,11 +10,15 @@ npm run dev      # vite dev server
 npm run build    # tsc --noEmit && vite build
 npm run preview
 npm run check:shaders   # compile every WGSL source under Dawn
+npm run check:kernels   # run the kernels under Dawn and check what they produce
+npm run check:ab        # did this change move the embedding? (dev tool, not CI)
 ```
 
-There is no test suite and no linter. `npm run build` (i.e. `tsc --noEmit`) and `npm run check:shaders` are the two automated checks; CI runs both. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`, and `scripts/` is type-checked alongside `src/`.
+There is no unit-test framework and no linter. The automated checks are `npm run build` (i.e. `tsc --noEmit`), `check:shaders` and `check:kernels`; CI runs all three. Strict mode is on; `@webgpu/types` is loaded globally via `tsconfig.json` `types`, and `scripts/` is type-checked alongside `src/`.
 
-Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. Nothing can be verified headlessly — the whole pipeline runs in the browser.
+The three sit at different levels and it is worth keeping them straight. `check:shaders` asks whether the WGSL compiles and pipelines. `check:kernels` asks whether the kernels compute the right thing — it runs them for real and compares against a CPU oracle, asserts invariants, or runs the same thing twice and demands the same answer. `check:ab` asks whether a change moved the embedding, which needs a baseline (a git ref) and returns a number to interpret rather than a verdict, so it stays out of CI. Reach for it on any refactor that is supposed to preserve behavior.
+
+Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. **The demo** cannot be verified headlessly — the DOM, the pane, the renderer and the playback transport all need a browser. The library can, and `scripts/` is how.
 
 ## Architecture
 
@@ -57,7 +61,13 @@ There is a third backend, `nndescentGPU` (`knn: "nndescent"`), approximate rathe
 
 Note that the demo cannot be verified headlessly, but the *library* can: bundling with esbuild (`--format=esm --platform=neutral`) produces something that runs under `@kmamal/gpu` (Dawn bindings for Node), which compiles the real WGSL and executes the kernels. Both kNN shaders shipped broken once because they were committed without ever being compiled — a WGSL parse error takes out every pipeline at once and the failure looks like a plausible blob rather than an error.
 
-That mechanism goes further than compilation, and the LocalMAP work leaned on it heavily: the same bundle runs a full `pacmapWebGPU` end to end, so a change that is supposed to preserve behavior can be **measured** against a bundle of the previous commit rather than eyeballed. Moving the further pairs out of the CSR was verified that way (max|Δ| / layout extent = 2.9e-5, against 0.50 for a deliberately broken version), as was LocalMAP's bit-exact reproducibility across processes. Three things to know if you rebuild that harness: `@kmamal/gpu` exposes `GPUBufferUsage`/`GPUShaderStage`/`GPUMapMode` as module properties rather than globals, it holds an interval per instance so the process needs an explicit `process.exit`, and `$?` after a pipe is the *last* command's status — which will happily hide a timeout. Always include a no-change control run; a confounded comparison otherwise looks like a passing one.
+That mechanism goes further than compilation, which is what `scripts/check-kernels.ts` and `scripts/ab-embedding.ts` are built on: the same bundle runs a full `pacmapWebGPU` end to end, so a kernel can be checked against a CPU oracle and a refactor can be **measured** against a bundle of an earlier commit rather than eyeballed. Moving the further pairs out of the CSR was landed on a 2.9e-5 from `check:ab`, against 0.50 for a version with the reverse-FP loop deleted.
+
+`scripts/dawn.ts` holds the device setup and the two bindings quirks that cost the most time — the WebGPU constants are module properties rather than globals, and each live instance holds an interval so a finished script still will not exit without `process.exit`. Two habits worth keeping when extending any of this: **always run the no-change control** (`npm run check:ab` on a clean tree must print exactly 0 — a confounded comparison otherwise reads as a pass, and did once), and **prove a new check can fail** by breaking the thing it covers before trusting it green. Note also that `$?` after a shell pipe is the *last* command's status, which will cheerfully hide a timeout in the middle.
+
+An oracle must not share code with what it checks. `check:kernels` recomputes the reverse CSR by bucket-then-flatten rather than calling `buildFpReverse`, and `buildFpReverse` stays unexported to keep that honest.
+
+One coverage gap is known and documented at its site: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
 
 `npm run check:shaders` is that mechanism, standing: `scripts/check-shaders.ts` compiles all six WGSL sources under Dawn and builds the real pipeline for every entry point. Pipelines matter as much as modules — a renamed entry point, an incompatible bind-group layout, or a bad vertex/blend state compiles clean and fails only at `createPipeline`. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader.
 
