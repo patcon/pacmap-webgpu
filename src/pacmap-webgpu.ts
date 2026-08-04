@@ -1191,8 +1191,9 @@ const FP_WG = 64;
  * Rebuilds the further-pair reverse CSR that `grad_main` gathers from, entirely
  * on the GPU. LocalMAP redraws the forward pairs every 10 iterations of phase 3
  * against the *embedding*, so this has to run where Y already lives — reading
- * positions back 25 times a run to rebuild the structure on the host is exactly
- * what this library is built not to do.
+ * positions back two dozen times a run to rebuild the structure on the host is
+ * exactly what this library is built not to do. (At the default phases the
+ * chain fires 24 times: iterations 210, 220 … 440.)
  *
  * The chain is clear -> count -> scan -> scatter -> sort, and it is the GPU
  * equivalent of `buildFpReverse`, which stays the oracle it was checked against.
@@ -1200,8 +1201,8 @@ const FP_WG = 64;
  * Two notes on the shape it takes:
  *
  * - **The scan is one serial invocation.** N is at most a few hundred thousand
- *   and this runs 25 times a run, so a single thread walking N counters costs a
- *   fraction of a millisecond. A two-level parallel scan would buy microseconds
+ *   and this runs two dozen times a run, so a single thread walking N counters
+ *   costs a fraction of a millisecond. A parallel two-level scan would buy µs
  *   and cost a page of WGSL with real correctness subtleties — the same trade
  *   the demo's single-workgroup bounds reduce makes.
  * - **The sort is not decoration.** `fp_scatter` claims slots with an atomic
@@ -1672,6 +1673,79 @@ export async function pacmapWebGPU(
 
   const groups = Math.ceil(N / 64);
 
+  // --- LocalMAP's local graph adjustment ---------------------------------
+  // Built only for the variant that uses it: under "pacmap" nothing below is
+  // allocated and nothing is encoded, so that path is exactly what it was.
+  //
+  // Its own bind group, because the shaders disagree about Y — the optimizer
+  // writes it, the resample only reads it — and because `layout: "auto"` would
+  // derive a different narrow layout per entry point.
+  const fp = (() => {
+    if (variant !== "localmap") return null;
+
+    const cntBuf = device.createBuffer({ size: N * 4, usage: S });
+    const nbBuf = mk(pairs.nbFwd, S);
+    const fpModule = device.createShaderModule({
+      code: fpShaderSource(N, nFP, nNB, lowDistThres, opts.seed ?? 42),
+    });
+    const fpLayout = device.createBindGroupLayout({
+      entries: [
+        storageEntry(0, "storage"),
+        storageEntry(1, "storage"),
+        storageEntry(2, "storage"),
+        storageEntry(3, "read-only-storage"),
+        storageEntry(4, "read-only-storage"),
+        {
+          binding: 5,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: {
+            type: "uniform",
+            hasDynamicOffset: true,
+            minBindingSize: 48,
+          },
+        },
+      ],
+    });
+    const fpPipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [fpLayout],
+    });
+
+    // Order is the chain: redraw, then rebuild the reverse CSR around it.
+    // fp_scan is the one serial stage — see its docstring.
+    const stages = (
+      [
+        ["fp_resample", groups],
+        ["fp_clear", groups],
+        ["fp_count", groups],
+        ["fp_scan", 1],
+        ["fp_scatter", groups],
+        ["fp_sort", groups],
+      ] as const
+    ).map(([entryPoint, n]) => ({
+      pipeline: device.createComputePipeline({
+        layout: fpPipelineLayout,
+        compute: { module: fpModule, entryPoint },
+      }),
+      groups: n,
+    }));
+
+    return {
+      stages,
+      buffers: [cntBuf, nbBuf],
+      bindGroup: device.createBindGroup({
+        layout: fpLayout,
+        entries: [
+          { binding: 0, resource: { buffer: fpFwdBuf } },
+          { binding: 1, resource: { buffer: fpRevBuf } },
+          { binding: 2, resource: { buffer: cntBuf } },
+          { binding: 3, resource: { buffer: yBuf } },
+          { binding: 4, resource: { buffer: nbBuf } },
+          { binding: 5, resource: { buffer: paramBuf, size: 48 } },
+        ],
+      }),
+    };
+  })();
+
   // --- Encode ------------------------------------------------------------
   // WebGPU synchronizes automatically between dispatches in a pass, so the
   // grad -> adam dependency needs no explicit barrier.
@@ -1684,6 +1758,23 @@ export async function pacmapWebGPU(
       pass.dispatchWorkgroups(groups);
       pass.setPipeline(adamPipe);
       pass.dispatchWorkgroups(groups);
+
+      // The graph adjustment runs after the step, on the embedding the step
+      // just produced — the order the reference's loop uses. The guard is its
+      // guard: strictly after n1+n2, every tenth iteration, so at the default
+      // phases this is 210, 220 … 440 and never 200.
+      //
+      // It chains into the same pass, so no host round-trip appears here and
+      // runRange still submits exactly one command buffer. Dispatches inside a
+      // pass are synchronized by WebGPU, so the chain needs no explicit barrier
+      // between its stages any more than grad -> adam does.
+      if (fp && it > n1 + n2 && it % 10 === 0) {
+        pass.setBindGroup(0, fp.bindGroup, [it * align]);
+        for (const stage of fp.stages) {
+          pass.setPipeline(stage.pipeline);
+          pass.dispatchWorkgroups(stage.groups);
+        }
+      }
     }
     pass.end();
     device.queue.submit([enc.finish()]);
@@ -1714,6 +1805,7 @@ export async function pacmapWebGPU(
       for (const b of [
         yBuf, offBuf, adjBuf, gradBuf, mBuf, vBuf, paramBuf,
         fpFwdBuf, fpRevBuf,
+        ...(fp?.buffers ?? []),
       ]) {
         b.destroy();
       }

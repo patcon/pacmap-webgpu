@@ -80,13 +80,21 @@ One commit per task, straight to `main`. Both gates after every task:
             the near-partner check → 287; ignoring `round` → caught by the
             different-round assertion.
 
-- [ ] **6. Wire the chain into `runRange`** — S — deps: 5
+- [x] **6. Wire the chain into `runRange`** — S — deps: 5
       `src/pacmap-webgpu.ts`
-      - [ ] chain appended after `adam` for `it > n1+n2 && it % 10 == 0` under `localmap`
-      - [ ] fires at 210, 220 … 440 for `(100,100,250)` — **not** at 200
-      - [ ] still one command buffer per `runRange`, still zero readback
-      - [ ] nothing extra encoded or allocated under `variant: "pacmap"`
-      - [ ] `destroy()` releases every new buffer
+      - [x] chain appended after `adam` for `it > n1+n2 && it % 10 == 0` under `localmap`
+      - [x] fires at 210, 220 … 440 for `(100,100,250)` — **not** at 200. That is
+            **24** fires, not the 25 the plan said; comments corrected.
+      - [x] still one command buffer per `runRange`, still zero readback
+      - [x] nothing extra encoded or allocated under `variant: "pacmap"` — the whole
+            `fp` object is `null` there
+      - [x] `destroy()` releases every new buffer
+      - [x] end-to-end, headless: pacmap unchanged vs the pre-refactor baseline
+            (2.9e-5); **localmap bit-exact reproducible across processes (0.0e+0)**,
+            which is the Phase 2 checkpoint criterion and what `fp_sort` exists for;
+            localmap ≠ pacmap (0.10); `lowDistThres` 2 vs 30 differ (0.64).
+            Gate proven with a 0.0e+0 sanity control: boundary `>=` → 0.109,
+            chain never encoded → 0.084, every-iteration → 0.111.
 
 ### ✅ Checkpoint: Phase 2
 - [ ] Both gates clean
