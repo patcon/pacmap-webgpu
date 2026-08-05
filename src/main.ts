@@ -732,10 +732,22 @@ const orbit = new Orbit(camera, {
   // The one thing keeping this 2D. Flipping it to true, and giving the shader a
   // third world component, is the 3D step.
   enableRotate: false,
-  // Orbit scales the drag by panSpeed before converting pixels to world units,
-  // and its own conversion is already exactly 1:1 (2*d*tan(fov/2)/clientHeight).
-  // So 1, not the 0.1 default, is what makes a drag track the cursor.
+  // These two go together, and neither is right alone.
+  //
+  // Orbit's pixel-to-world conversion is exactly 1:1 already
+  // (2*d*tan(fov/2)/clientHeight, and every point sits on the target plane), so
+  // panSpeed wants to be 1 rather than the 0.1 default. But `update()` adds the
+  // whole of panDelta to the target *every frame* and only decays it by
+  // `inertia` afterwards — it never clears it — so one drag delta is applied
+  // d + 0.85d + 0.85^2 d + ... = d/(1 - inertia), i.e. 6.7x over. ogl's 0.1
+  // default is tuned against that coasting, not against the conversion.
+  //
+  // inertia: 0 applies each delta once and drops the throw, which is what makes
+  // a drag track the cursor exactly — the point under the pointer stays under
+  // it, Google-Maps style. Pan is never eased (the target is moved directly),
+  // so `ease` is left alone: it only smooths the zoom.
   panSpeed: 1,
+  inertia: 0,
   minDistance: DEFAULT_DIST / 40,
   maxDistance: DEFAULT_DIST * 20,
 });
