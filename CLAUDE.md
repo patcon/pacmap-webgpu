@@ -21,7 +21,7 @@ The four sit at different levels and it is worth keeping them straight. `check:s
 
 `check:druid` is also the one that needs no GPU at all — the druid path is plain JS, so it runs anywhere Node does. It rides in CI's `gpu` job regardless, because like the other behaviour checks it should report a regression rather than break a page that tsc and vite already accepted.
 
-Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. **The demo** cannot be verified headlessly — the DOM, the pane, the renderer and the playback transport all need a browser. The library can, and `scripts/` is how; so can the DruidJS backends, which need neither a browser nor a GPU. What that leaves uncovered is the *wiring* — the worker handshake, the dropdown, the stop button — so a change to `main.ts` still wants a browser before it is believed.
+Running the app requires a WebGPU-capable browser (Chrome/Edge 113+, Firefox 141+ on Windows / 145+ on Apple silicon, Safari 26). If the page reports no adapter, check `navigator.gpu` in the console. **The demo** cannot be verified headlessly — the DOM, the pane, the renderer and the playback transport all need a browser. The library can, and `scripts/` is how; so can the DruidJS backends, which need neither a browser nor a GPU. What that leaves uncovered is the *wiring* — the worker handshake, the dropdown, the stop button, every camera gesture — so a change to `main.ts` still wants a browser before it is believed.
 
 ## Architecture
 
@@ -44,7 +44,28 @@ The options map is annotated `Record<string, AlgoKey>` rather than inferred. Twe
 
 The transport bar is always present. It never hides — it goes inert (controls disabled, readout `—`) so a run doesn't reflow the canvas.
 
-Tweakpane (one of two runtime dependencies, the other being DruidJS) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
+Tweakpane (one of three runtime dependencies, the others being DruidJS and ogl) is mounted into `#pane`, an absolutely-positioned child of `#stage`, rather than its default fixed top-right, which would land under the header. Its bindings mutate the module-level `view` object; a run installs `onViewChange` so an edit rewrites *that* run's view uniform immediately, including mid-run when nothing else is touching it. Point size is a CSS-px radius, scaled by dpr and floored at 1.5 framebuffer px.
+
+### The camera (`main.ts`)
+
+Pan and zoom sit on **top** of the bounds framing rather than replacing it. The vertex shader maps data to *world* — `(p - ctr) / (span * 0.55)`, the same normalization as before, so the embedding is always centred on the origin and the camera never has to re-fit — and a view-projection `mat4` in the view uniform maps world to clip. All camera state is CPU-side, so nothing is read back and the invariant is untouched; the matrix rides along in the same `writeBuffer` as `res` and `radius`.
+
+It is a **real perspective camera, not a 2D transform, because 3D rendering is the next step.** An affine scale/offset would have to be thrown away at that point. What keeps it 2D today is exactly two things: `enableRotate: false` on the controller, and the shader passing `0.0` for the world z. The 3D step flips the first, feeds the second a third component, and restores Orbit's default mouse mapping.
+
+`camera` and `orbit` come from **ogl**, whose `Camera` and `Orbit` are used purely as math and input — `Renderer` is never constructed and no WebGL context exists. `Camera`'s first constructor argument is a `gl` context that the class genuinely never touches, which is what makes that possible. ogl is MIT, so unlike the DruidJS note below it raises nothing.
+
+Four things worth knowing before touching it:
+
+- **The default camera reproduces the pre-camera framing exactly**, and this is not a guessable constant. World half-extent is `1/(2*0.55) = 0.909`; the old shader sent that straight to 0.909 of NDC height; a perspective camera sees a half-height of `d*tan(fov/2)`, so the visible half-height must be 1 and `DEFAULT_DIST = 1/tan(fov/2)` ≈ 2.414 at `fov: 45`. Verified against the old formula across aspect ratios to 2.8e-16 in NDC. The projection also owns the aspect divide the shader used to do by hand.
+- **The uploaded matrix carries a `z' = (z + w)/2` remap.** ogl emits WebGL clip space, where z runs `[-1, 1]`; WebGPU's runs `[0, 1]` and clips below it. Nothing renders differently today because there is no depth attachment — this is here so that turning on depth testing for 3D does not silently discard half the points.
+- **The live phase runs its own rAF.** Orbit eases toward its target and so needs a tick every frame, but during a run the only other redraws come from `captureAndDraw`, which under the CPU engine can be seconds apart — a gesture would freeze between captures. That loop redraws only when the camera actually moved or a view edit is pending, then hands over to the playback rAF (which redraws unconditionally) when the run ends. The two never run at once.
+- **Orbit's defaults are wrong here in two specific ways**, both fixed at construction. Its mouse map is left-rotate / right-pan, and `onMouseDown` tests ORBIT first and returns early when rotation is disabled — so pointing `PAN` at button 0 is not enough, `ORBIT` has to move off it too. And `panSpeed` scales the drag *before* Orbit's own pixel-to-world conversion, which is already exactly 1:1, so the `0.1` default drags at a tenth of the cursor.
+
+Point radius is deliberately **screen-constant** under zoom: the quad offset is added after projection and multiplied by `clip.w`, cancelling the perspective divide, so zooming resolves a dense cluster instead of magnifying it. The reference project this borrows from does the opposite; switching is one line.
+
+`reset camera` in the view folder, a double-click on the canvas, and the start of every run all call `resetCamera()`. `orbit.forcePosition()` is the load-bearing line in it — Orbit keeps its own spherical coordinates and eases toward them, so moving the camera without it is undone on the next `update()`. Resetting per run is the same call the transport already makes; the alternative is persisting the camera across runs.
+
+One gap, from Orbit rather than from choice: with rotation off, one-finger touch drag does nothing, because Orbit routes single-touch to rotate. Two-finger pinch and pan both work.
 
 ### Playback history (`main.ts`)
 
@@ -80,7 +101,7 @@ That mechanism goes further than compilation, which is what `scripts/check-kerne
 
 An oracle must not share code with what it checks. `check:kernels` recomputes the reverse CSR by bucket-then-flatten rather than calling `buildFpReverse`, and `buildFpReverse` stays unexported to keep that honest.
 
-Two coverage gaps are known, both of the same shape — the pieces are checked, the wiring between them is not. The second is `check:druid`, which covers the druid backends and the parameter mapping but not the worker handshake, the dropdown or the stop button; those need a browser. The first: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
+Three coverage gaps are known, all of the same shape — the pieces are checked, the wiring between them is not. The third is the camera: `check:shaders` proves the new `View` struct compiles and pipelines, and the default framing was checked numerically against the formula it replaced, but no check sees a wheel, a drag or the reset button. The second is `check:druid`, which covers the druid backends and the parameter mapping but not the worker handshake, the dropdown or the stop button; those need a browser. The first: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
 
 `npm run check:shaders` is that mechanism, standing: `scripts/check-shaders.ts` compiles all six WGSL sources under Dawn and builds the real pipeline for every entry point. Pipelines matter as much as modules — a renamed entry point, an incompatible bind-group layout, or a bad vertex/blend state compiles clean and fails only at `createPipeline`. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader.
 
