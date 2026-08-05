@@ -11,7 +11,7 @@ import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
 import { boundsWGSL, renderWGSL } from "./shaders";
 import { Pane } from "tweakpane";
-import { Camera, type OGLRenderingContext } from "ogl";
+import { Camera, Orbit, Vec3, type OGLRenderingContext } from "ogl";
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -373,13 +373,47 @@ async function go() {
     }
     // Point-size edits land immediately, even mid-run when nothing else is
     // rewriting the view uniform.
+    let viewDirty = false;
     onViewChange = () => {
-      if (gen === runGen) resize();
+      if (gen === runGen) viewDirty = true;
     };
     window.addEventListener("resize", () => {
-      if (gen === runGen) resize();
+      if (gen === runGen) viewDirty = true;
     });
     resize();
+
+    // Orbit eases toward its target, so it needs a tick every frame, and the
+    // camera has to stay responsive while the optimizer is running. During the
+    // run the only other redraws come from `captureAndDraw`, which under the CPU
+    // engine can be seconds apart — a gesture would freeze between frames. So
+    // the live phase gets its own rAF, which hands over to the playback loop
+    // below once the run is done rather than running alongside it.
+    let livePhase = true;
+    let camKey = "";
+    /** Has the camera moved since the last tick? Also seeds `camKey`. */
+    function cameraMoved() {
+      const p = camera.position;
+      const t = orbit.target;
+      const key = `${p.x},${p.y},${p.z}|${t.x},${t.y},${t.z}`;
+      if (key === camKey) return false;
+      camKey = key;
+      return true;
+    }
+    const camTick = () => {
+      if (gen !== runGen || !livePhase) return;
+      orbit.update();
+      if (cameraMoved() || viewDirty) {
+        viewDirty = false;
+        resize();
+        // `boundsUniform` already holds the box for the frame on screen, so
+        // re-encoding the render alone is enough — no compute, no readback.
+        const enc = device.createCommandEncoder();
+        encodeRender(enc, pm.positions, 0);
+        device.queue.submit([enc.finish()]);
+      }
+      requestAnimationFrame(camTick);
+    };
+    requestAnimationFrame(camTick);
 
     function encodeRender(
       enc: GPUCommandEncoder,
@@ -593,12 +627,16 @@ async function go() {
     }
 
     // Keeps drawing after convergence so resizing still works, and advances the
-    // playhead when playing.
+    // playhead when playing. Takes over the camera from `camTick`, which stops
+    // itself on the next frame — this loop redraws unconditionally, so it needs
+    // no dirty tracking.
+    livePhase = false;
     let last = performance.now();
     const tick = (now: number) => {
       if (gen !== runGen) return; // a newer run owns the canvas
       const dt = (now - last) / 1000;
       last = now;
+      orbit.update();
       if (playing) {
         const next = playhead + dt * PLAYBACK_FPS;
         if (next >= banked - 1) {
@@ -680,6 +718,20 @@ const camera = new Camera(null as unknown as OGLRenderingContext, {
  */
 const DEFAULT_DIST = 1 / Math.tan((FOV * Math.PI) / 360);
 camera.position.set(0, 0, DEFAULT_DIST);
+
+// Constructed once, at module scope rather than per run: `go()` already leaks a
+// window resize listener per run, harmless only because of the `gen === runGen`
+// guard, and a controller that attached its own handlers per run would stack
+// them for real.
+const orbit = new Orbit(camera, {
+  element: canvas,
+  target: new Vec3(0, 0, 0),
+  // The one thing keeping this 2D. Flipping it to true, and giving the shader a
+  // third world component, is the 3D step.
+  enableRotate: false,
+  minDistance: DEFAULT_DIST / 40,
+  maxDistance: DEFAULT_DIST * 20,
+});
 
 /**
  * PaCMAP pair ratios. n_MN and n_FP are counts per point, derived as

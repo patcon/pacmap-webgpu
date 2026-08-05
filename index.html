@@ -35,7 +35,11 @@
   /* The pane is absolutely positioned inside #stage rather than using
      Tweakpane's default fixed top-right, which would sit under the header. */
   #stage { flex: 1; min-height: 0; position: relative; }
-  #view { width: 100%; height: 100%; display: block; }
+  /* touch-action: none, or the browser claims touch drags as scroll/zoom before
+     the camera controller ever sees them. */
+  #view { width: 100%; height: 100%; display: block; touch-action: none;
+          cursor: grab; }
+  #view:active { cursor: grabbing; }
   /* Tweakpane's value column is a fixed 160px, so the label gets whatever is
      left — at the old 210px that was ~30px and every label truncated. */
   #pane {
