@@ -87,6 +87,28 @@ const KNN_CHECK = qs.get("knncheck") === "1";
 const HISTORY_BUDGET_BYTES = 128 << 20;
 const PLAYBACK_FPS = 60;
 
+// With auto zoom off the whole trace is framed by one box, and during a live run
+// the box that frames the *final* frame is not yet known. The previous run's is
+// the best guess available, so it is carried across runs and page reloads. Same
+// `loX loY hiX hiY` layout the bounds shader writes, so it drops straight into
+// the render's bounds uniform.
+const BOUNDS_KEY = "pacmap:lastBounds";
+let seedBounds: Float32Array<ArrayBuffer> | null = readSeedBounds();
+
+function readSeedBounds(): Float32Array<ArrayBuffer> | null {
+  // A cosmetic cache; nothing here may take out startup.
+  try {
+    const raw = sessionStorage.getItem(BOUNDS_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!Array.isArray(v) || v.length !== 4) return null;
+    if (!v.every((x) => typeof x === "number" && Number.isFinite(x))) return null;
+    return new Float32Array(v);
+  } catch {
+    return null;
+  }
+}
+
 // Colors for digits 0-9. Distinct hues, roughly matched in luminance so no one
 // class dominates visually.
 const PALETTE: [number, number, number][] = [
@@ -371,8 +393,17 @@ async function go() {
       cp.setBindGroup(0, boundsBG);
       cp.dispatchWorkgroups(1);
       cp.end();
-      enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, 16);
+      // Banked unconditionally: 16 bytes, and toggling auto zoom back on mid-run
+      // has to find a bound for every slot behind it.
       enc.copyBufferToBuffer(boundsStorage, 0, boundsHistory, slot * 16, 16);
+      if (view.autoZoom || !seedBounds) {
+        enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, 16);
+      } else {
+        // Held fixed, but the final frame's bound doesn't exist yet — the
+        // previous run's is the only guess there is. Ordered against the submit
+        // below on the queue timeline, so writing it here is safe.
+        device.queue.writeBuffer(boundsUniform, 0, seedBounds);
+      }
       enc.copyBufferToBuffer(
         pm.positions,
         0,
@@ -387,8 +418,12 @@ async function go() {
 
     /** Draw a banked frame. No compute, no readback — two copies and a pass. */
     function drawFrame(slot: number) {
+      // Auto zoom frames each slot to its own extent; held, the whole trace is
+      // framed by the last slot, so the scrubber shows travel rather than a
+      // camera that cancels it out.
+      const boundsSlot = view.autoZoom ? slot : banked - 1;
       const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(boundsHistory, slot * 16, boundsUniform, 0, 16);
+      enc.copyBufferToBuffer(boundsHistory, boundsSlot * 16, boundsUniform, 0, 16);
       encodeRender(enc, posHistory, slot * frameBytes);
       device.queue.submit([enc.finish()]);
     }
@@ -454,6 +489,32 @@ async function go() {
     // `frameCount`, and the frames themselves are as valid as any other.
     const stopped = abort.signal.aborted;
     banked = slot + 1;
+
+    // The bound the next run holds its live frames to, before it has one of its
+    // own. Sixteen bytes, once, after the loop — not the per-frame `mapAsync` on
+    // positions the render path forbids. Overwrites rather than unions, so a 2k
+    // run after a 65k one isn't stuck with a view sized for the big one.
+    {
+      const staging = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(boundsHistory, (banked - 1) * 16, staging, 0, 16);
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const last = new Float32Array(staging.getMappedRange().slice(0));
+      staging.unmap();
+      staging.destroy();
+      if (last.every((x) => Number.isFinite(x))) {
+        seedBounds = last;
+        try {
+          sessionStorage.setItem(BOUNDS_KEY, JSON.stringify(Array.from(last)));
+        } catch {
+          // Private mode or quota. The in-memory copy still serves this session.
+        }
+      }
+    }
 
     // On a stop, this is what kills the druid worker — the whole point of the
     // button. Replay reads `posHistory`/`boundsHistory`, which are owned here
@@ -561,7 +622,10 @@ function frame(): Promise<void> {
 // The dense default (what the fixed radius used to be above 8k points) is the
 // default at every N — a size that stays readable when crowded is a fine
 // starting point when it isn't, and the slider is right there.
-const view = { pointSize: 1.8 };
+// `autoZoom` on is the behaviour that predates the checkbox: every frame framed
+// to its own extent. Off holds one box for the whole trace, which is what makes
+// the points' actual travel visible rather than cancelled out by the camera.
+const view = { pointSize: 1.8, autoZoom: true };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
 let onViewChange: (() => void) | null = null;
@@ -626,6 +690,12 @@ viewFolder
     max: 2,
     step: 0.1,
   })
+  .on("change", () => onViewChange?.());
+// Nothing to install for this one: the post-run rAF redraws every tick and
+// `captureAndDraw` re-reads it per captured frame, so a toggle lands on the next
+// frame either way. `onViewChange` is here only to keep the two bindings alike.
+viewFolder
+  .addBinding(view, "autoZoom", { label: "auto zoom" })
   .on("change", () => onViewChange?.());
 
 const pacmapFolder = pane.addFolder({ title: "dimensional reduction" });
