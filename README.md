@@ -50,6 +50,34 @@ predict — the CPU brute force measures fastest in practice, which is why it is
 the default. Don't reason about the three from their complexity; measure with
 `?knncheck=1`.
 
+## Two or three dimensions
+
+`components` in the pane, or `?dims=3`. Default is 2. It is setup-time, like
+everything else in that folder: the buffers, the generated shaders and the
+vertex layout are all sized from it before the first iteration, so the folder
+is disabled while a run is in flight.
+
+Both engines honour it — ours as `nComponents`, druid as its own `n_components`
+— and the 2D path is bit-identical to what predates the switch.
+
+In 3D, **left-drag orbits and right-drag pans** (2D keeps left-drag panning,
+since there is nothing to rotate). The `occlusion` checkbox in the `view` folder
+decides how depth is painted:
+
+- **On** (default): points are opaque discs drawn against a depth buffer, so
+  near clusters genuinely hide far ones. No sorting and no readback — which
+  matters, because the usual answer, sorting an index buffer on the CPU each
+  frame, is exactly the per-frame readback this renderer is built to avoid.
+- **Off**: everything blends in buffer order, so density reads as opacity and
+  depth comes only from parallax as you drag.
+
+The checkbox is greyed in 2D, where the points are coplanar and a depth buffer
+would resolve ties by whatever order the buffer happens to be in.
+
+A 3D frame is 50% larger, so at the same 128MB history budget a 3D run banks
+fewer frames — or captures every *n*th iteration instead. The status line says
+which.
+
 ## Two algorithms
 
 Pick one from the `algorithm` dropdown, or with `?algo=`:

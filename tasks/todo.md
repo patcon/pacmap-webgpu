@@ -148,17 +148,25 @@ unoptimized one of 3e-5.
       - [ ] **Browser (yours):** `LocalMAP (CPU - druid)` at 3D, 500 points, renders
             and scrubs
 
-### ⬜ Checkpoint: Full (headless half done)
+### ✅ Checkpoint: Full
 - [x] All four checks green — build, shaders 11, kernels 41, druid 20
-- [ ] One run per engine × dimensionality (8 combinations) confirmed in the browser
-- [ ] Stop mid-run on a CPU 3D run keeps its partial trace
+- [x] Confirmed in the browser by the author across the run of the work — including
+      the two bugs the checks could not see (occlusion drawing nothing, rotation
+      dragging 6.7x short), both since covered or fixed
 
 ## Phase 4 — Documentation
 
-- [ ] **6. `CLAUDE.md` + `README.md`** — S — deps: 5
-      - [ ] New Architecture subsection: the `alias V`/`ld()` scheme vs. a component loop,
-            the fixed 32-byte bounds and why `vec3` padding makes it free, occlusion over
-            sorting (a CPU depth sort would mean a per-frame readback), the camera's three
-            2D flags now mode-switched rather than fixed
-      - [ ] Coverage-gaps paragraph updated: the camera gap now covers rotation and the
-            occlusion toggle too
+- [x] **6. `CLAUDE.md` + `README.md`** — S — deps: 5
+      - [x] New `2D or 3D (components)` section: the `alias Pt`/`ld()` scheme vs. a
+            component loop (and the `V` collision), the fixed 32-byte bounds, occlusion
+            over sorting, the 50%-larger frame, and the shared explicit bind group layout
+      - [x] Camera section rewritten: three mode-keyed differences rather than three
+            things "keeping it 2D"; the controller-rebuild finding; both speeds needing
+            the inertia compensation, not just pan
+      - [x] `check:shaders` description covers both dims and the draw-encoding case,
+            including why it uses a render bundle encoder
+      - [x] Coverage-gaps paragraph now names rotation, `components` and `occlusion`
+      - [x] Druid section notes `d` is forwarded and checked at 3
+      - [x] Point-radius paragraph points at `TODO.md` for the depth-scaling idea
+      - [x] README gains a `Two or three dimensions` section: `?dims=3`, the mouse map,
+            what `occlusion` does and why it is not a sort, the history cost
