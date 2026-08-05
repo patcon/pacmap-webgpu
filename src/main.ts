@@ -729,9 +729,27 @@ const orbit = new Orbit(camera, {
   // The one thing keeping this 2D. Flipping it to true, and giving the shader a
   // third world component, is the 3D step.
   enableRotate: false,
+  // Orbit scales the drag by panSpeed before converting pixels to world units,
+  // and its own conversion is already exactly 1:1 (2*d*tan(fov/2)/clientHeight).
+  // So 1, not the 0.1 default, is what makes a drag track the cursor.
+  panSpeed: 1,
   minDistance: DEFAULT_DIST / 40,
   maxDistance: DEFAULT_DIST * 20,
 });
+// Orbit's default is left-rotate / right-pan, which with rotation off would
+// leave left-drag doing nothing at all. Left has to pan for a 2D view. Note the
+// switch in `onMouseDown` tests ORBIT first and bails when rotation is disabled,
+// so it isn't enough to point PAN at 0 — ORBIT has to move off it. The 3D step
+// restores the defaults.
+//
+// The cast is because ogl's .d.ts omits `mouseButtons`, which its constructor
+// does set (`Orbit.js`); the property is real, only the declaration is short.
+type MouseButtons = { ORBIT: number; ZOOM: number; PAN: number };
+(orbit as Orbit & { mouseButtons: MouseButtons }).mouseButtons = {
+  ORBIT: 2,
+  ZOOM: 1,
+  PAN: 0,
+};
 
 /**
  * PaCMAP pair ratios. n_MN and n_FP are counts per point, derived as
