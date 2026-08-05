@@ -116,6 +116,19 @@ unoptimized one of 3e-5.
       - [x] `view.occlusion` checkbox, default on, greyed in 2D via `syncComponents`
       - [x] `check:shaders` builds the depth pipeline (10 cases), and it was shown
             failing first by handing it a colour format for its depth state
+      - [x] **Bug found in the browser, then covered:** both pipelines were built with
+            `layout: "auto"`, which mints a *fresh* bind group layout per pipeline —
+            never compatible with another's. The bind group built from `renderPipe`
+            could not be set under `renderPipeDepth`, so the draw was dropped at
+            validation and every point vanished the moment occlusion was ticked. Fixed
+            with one explicit `GPUBindGroupLayout` shared by both
+      - [x] New `render-3d-occlusion-draw` case encodes a real draw per mode via a
+            **render bundle encoder** — it takes attachment formats rather than views,
+            which validates bind-group-vs-layout and depth-state-vs-format, and is the
+            only way to encode a draw under these bindings at all (@kmamal/gpu's
+            `createView()` sends a component swizzle this adapter lacks, so no texture
+            view can be made and no render pass begun). Restoring `layout: "auto"`
+            reproduces the browser's exact error message
       - [ ] **Browser (yours):** occlusion on — near clusters hide far ones, no dark
             streaks; off — back to the blended haze; 2D unaffected and greyed
 

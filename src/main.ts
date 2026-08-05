@@ -317,8 +317,29 @@ async function go() {
     const renderModule = device.createShaderModule({
       code: renderWGSL(nComponents),
     });
+    // Explicit, not "auto". A pipeline created with "auto" gets its own
+    // freshly-minted bind group layout, and layouts minted that way are never
+    // compatible with another pipeline's — so a bind group built from
+    // `renderPipe` cannot be set while `renderPipeDepth` is bound, and the
+    // draw is dropped as a validation error. Symptom: turning occlusion on
+    // makes every point vanish while the camera keeps working.
+    const renderBGL = device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: "uniform" },
+        },
+        {
+          // The fragment reads this one too, for the occlude flag.
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
     const renderDesc: GPURenderPipelineDescriptor = {
-      layout: "auto",
+      layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
       vertex: {
         module: renderModule,
         entryPoint: "vs",
@@ -397,7 +418,7 @@ async function go() {
     let depthView: GPUTextureView | null = null;
 
     const renderBG = device.createBindGroup({
-      layout: renderPipe.getBindGroupLayout(0),
+      layout: renderBGL,
       entries: [
         { binding: 0, resource: { buffer: boundsUniform } },
         { binding: 1, resource: { buffer: viewUniform } },

@@ -26,7 +26,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const gpu = require("@kmamal/gpu");
 
-const { GPUShaderStage } = gpu;
+const { GPUShaderStage, GPUBufferUsage } = gpu;
 
 // Sizes are baked into the sources as WGSL constants, and several become the
 // length of a private array (`array<f32, D>`, `array<f32, K>`). Toy values
@@ -244,6 +244,112 @@ const cases: Case[] = [
     },
     }))
   ),
+  {
+    // The one case that encodes a draw.
+    //
+    // Creating both 3D pipelines proves each is individually valid. It says
+    // nothing about whether one bind group can serve both, or whether what
+    // they are drawn into carries the attachments their state demands — and
+    // those are the mistakes that produce a blank canvas rather than an error
+    // anyone sees. A pipeline built with `layout: "auto"` mints its own bind
+    // group layout, incompatible with any other pipeline's, so the draw is
+    // dropped at validation. Occlusion shipped that way once: every point
+    // vanished the moment it was ticked, while the camera kept working.
+    //
+    // A render *bundle* encoder rather than a pass, because it takes
+    // attachment formats instead of views. That validates exactly what is
+    // wanted here — setBindGroup against the pipeline's layout, and the
+    // pipeline's depth state against the declared depth format — and it is
+    // also the only way to encode a draw under these bindings at all:
+    // @kmamal/gpu's `createView()` unconditionally sends a component swizzle
+    // that this adapter does not support, so no texture view can be made and
+    // no render pass begun.
+    name: "render-3d-occlusion-draw",
+    code: renderWGSL(3),
+    build: (device, module) => {
+      const M = 8; // instances; the count is irrelevant, the encoding is not
+      const bgl = device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" as const },
+          },
+          {
+            // The fragment reads this one too, for the occlude flag.
+            binding: 1,
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform" as const },
+          },
+        ],
+      });
+      const desc: GPURenderPipelineDescriptor = {
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        vertex: {
+          module,
+          entryPoint: "vs",
+          buffers: [
+            {
+              arrayStride: 12,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 0, offset: 0, format: "float32x3" as const },
+              ],
+            },
+            {
+              arrayStride: 4,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 1, offset: 0, format: "uint32" as const },
+              ],
+            },
+          ],
+        },
+        fragment: {
+          module,
+          entryPoint: "fs",
+          targets: [{ format: "rgba8unorm" as const }],
+        },
+        primitive: { topology: "triangle-list" as const },
+      };
+      const blended = device.createRenderPipeline(desc);
+      const occluded = device.createRenderPipeline({
+        ...desc,
+        depthStencil: {
+          format: DEPTH_FORMAT,
+          depthWriteEnabled: true,
+          depthCompare: "less" as const,
+        },
+      });
+
+      const uniform = (size: number) =>
+        device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM });
+      const bindGroup = device.createBindGroup({
+        layout: bgl,
+        entries: [
+          { binding: 0, resource: { buffer: uniform(32) } }, // Bounds
+          { binding: 1, resource: { buffer: uniform(80) } }, // View
+        ],
+      });
+      const vbuf = (size: number) =>
+        device.createBuffer({ size, usage: GPUBufferUsage.VERTEX });
+      const positions = vbuf(M * 12);
+      const labels = vbuf(M * 4);
+
+      for (const occlude of [false, true]) {
+        const bundle = device.createRenderBundleEncoder({
+          colorFormats: ["rgba8unorm"],
+          ...(occlude ? { depthStencilFormat: DEPTH_FORMAT } : {}),
+        });
+        bundle.setPipeline(occlude ? occluded : blended);
+        bundle.setBindGroup(0, bindGroup);
+        bundle.setVertexBuffer(0, positions);
+        bundle.setVertexBuffer(1, labels);
+        bundle.draw(6, M);
+        bundle.finish();
+      }
+    },
+  },
 ];
 
 async function main(): Promise<number> {
