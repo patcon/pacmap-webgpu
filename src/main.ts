@@ -145,6 +145,9 @@ async function go() {
   const abort = new AbortController();
   runAbort = abort;
   resetTransport();
+  // A new run starts from the designated view rather than inheriting wherever
+  // the last one was left parked, on the same reasoning as the transport reset.
+  resetCamera();
   pacmapFolder.disabled = true; // setup-time params; this run is committed
 
   try {
@@ -751,6 +754,19 @@ type MouseButtons = { ORBIT: number; ZOOM: number; PAN: number };
   PAN: 0,
 };
 
+/** Back to the designated view: the framing that predates the camera. */
+function resetCamera() {
+  orbit.target.set(0, 0, 0);
+  camera.position.set(0, 0, DEFAULT_DIST);
+  camera.up.set(0, 1, 0);
+  // Required, and easy to miss: Orbit keeps its own spherical coordinates and
+  // eases toward them, so without this the next update() snaps straight back to
+  // wherever the user left it.
+  orbit.forcePosition();
+}
+
+canvas.addEventListener("dblclick", resetCamera);
+
 /**
  * PaCMAP pair ratios. n_MN and n_FP are counts per point, derived as
  * round(n_neighbors * ratio) inside the library, so these are the knobs the
@@ -818,6 +834,10 @@ viewFolder
 viewFolder
   .addBinding(view, "autoZoom", { label: "auto zoom" })
   .on("change", () => onViewChange?.());
+// Double-clicking the canvas does the same thing.
+viewFolder
+  .addButton({ title: "reset camera" })
+  .on("click", () => resetCamera());
 
 const pacmapFolder = pane.addFolder({ title: "dimensional reduction" });
 
