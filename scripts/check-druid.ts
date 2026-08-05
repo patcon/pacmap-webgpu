@@ -104,14 +104,18 @@ interface RunOpts {
   variant: "pacmap" | "localmap";
   n_neighbors?: number;
   seed?: number;
+  /** Embedding width. Default 2, as the demo's own default is. */
+  d?: 2 | 3;
 }
 
-/** One embedding, flattened to the N x 2 f32 the GPU buffer would receive. */
+/** One embedding, flattened to the N x d f32 the GPU buffer would receive. */
 function embed(o: RunOpts): { Y: Float32Array; ms: number } {
+  const d = o.d ?? 2;
   // The real mapping, the one the worker ships — so a typo there fails the
   // behavioural checks below, not just the key-set check.
   const params = buildDruidParams({
     variant: o.variant,
+    nComponents: d,
     nNeighbors: o.n_neighbors ?? 10,
     mnRatio: 0.5,
     fpRatio: 2.0,
@@ -128,10 +132,9 @@ function embed(o: RunOpts): { Y: Float32Array; ms: number } {
   const out = dr.transform() as Float64Array[];
   const ms = performance.now() - t0;
 
-  const Y = new Float32Array(N * 2);
+  const Y = new Float32Array(N * d);
   for (let i = 0; i < out.length; i++) {
-    Y[i * 2] = out[i][0];
-    Y[i * 2 + 1] = out[i][1];
+    for (let c = 0; c < d; c++) Y[i * d + c] = out[i][c];
   }
   return { Y, ms };
 }
@@ -151,10 +154,10 @@ function relDelta(a: Float32Array, b: Float32Array): number {
 // Checks
 // ---------------------------------------------------------------------------
 
-function contractHolds(name: string, Y: Float32Array, ms: number): void {
+function contractHolds(name: string, Y: Float32Array, ms: number, d = 2): void {
   check(
     `${name}/shape-and-finite`,
-    Y.length === N * 2 && Y.every(Number.isFinite),
+    Y.length === N * d && Y.every(Number.isFinite),
     `length ${Y.length}, ${Y.filter((v) => !Number.isFinite(v)).length} non-finite`
   );
   // A layout that collapsed to a point is finite and the right shape, and would
@@ -169,21 +172,21 @@ function contractHolds(name: string, Y: Float32Array, ms: number): void {
  * The weakest possible statement that the embedding means anything: a run that
  * silently degenerated into noise passes every other check here.
  */
-function structurePreserved(name: string, Y: Float32Array): void {
+function structurePreserved(name: string, Y: Float32Array, d = 2): void {
   let intra = 0;
   let intraN = 0;
   let inter = 0;
   let interN = 0;
   for (let i = 0; i < N; i++) {
     for (let j = i + 1; j < N; j++) {
-      const dx = Y[i * 2] - Y[j * 2];
-      const dy = Y[i * 2 + 1] - Y[j * 2 + 1];
-      const d = Math.hypot(dx, dy);
+      const dist = Math.hypot(
+        ...Array.from({ length: d }, (_, c) => Y[i * d + c] - Y[j * d + c])
+      );
       if (blobOf[i] === blobOf[j]) {
-        intra += d;
+        intra += dist;
         intraN++;
       } else {
-        inter += d;
+        inter += dist;
         interN++;
       }
     }
@@ -230,6 +233,7 @@ function paramKeysAreReal(): void {
   const pacKeys = Object.keys(
     buildDruidParams({
       variant: "pacmap",
+      nComponents: 2,
       nNeighbors: 10,
       mnRatio: 0.5,
       fpRatio: 2,
@@ -241,6 +245,7 @@ function paramKeysAreReal(): void {
   const lmKeys = Object.keys(
     buildDruidParams({
       variant: "localmap",
+      nComponents: 2,
       nNeighbors: 10,
       mnRatio: 0.5,
       fpRatio: 2,
@@ -278,6 +283,7 @@ function paramKeysAreReal(): void {
   // arithmetic diverges between them.
   const p = buildDruidParams({
     variant: "pacmap",
+    nComponents: 2,
     nNeighbors: 10,
     mnRatio: 0.5,
     fpRatio: 2,
@@ -311,6 +317,7 @@ function paramKeysAreReal(): void {
 function workerDrivingIsEquivalent(): void {
   const params = buildDruidParams({
     variant: "pacmap",
+    nComponents: 2,
     nNeighbors: 10,
     mnRatio: 0.5,
     fpRatio: 2.0,
@@ -370,6 +377,16 @@ function main(): number {
   contractHolds("localmap", lm.Y, lm.ms);
   structurePreserved("pacmap", pac.Y);
   structurePreserved("localmap", lm.Y);
+
+  // Three components. The key-set check above proves `d` is spelled the way
+  // druid declares it; this proves the value is *forwarded* rather than
+  // constant, which a hard-coded `d: 2` would pass the first check and fail
+  // this one. Both halves matter: the length says druid returned three
+  // columns, and the separation says the third one carries structure rather
+  // than sitting at whatever the initializer left.
+  const pac3 = embed({ variant: "pacmap", d: 3 });
+  contractHolds("pacmap-3d", pac3.Y, pac3.ms, 3);
+  structurePreserved("pacmap-3d", pac3.Y, 3);
 
   // Determinism at a fixed seed. The demo banks a trace and replays it, so a run
   // that is not reproducible cannot be compared against anything.

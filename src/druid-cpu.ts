@@ -26,6 +26,8 @@ import type { EmbeddingRun } from "./pacmap-webgpu";
 
 export interface DruidCpuOptions {
   variant?: DruidVariant;
+  /** Embedding width. Default 2. Druid takes it as `d`. */
+  nComponents?: number;
   nNeighbors?: number;
   mnRatio?: number;
   fpRatio?: number;
@@ -65,8 +67,10 @@ export async function druidCPU(
   const totalIters = phases[0] + phases[1] + phases[2];
   const onStatus = opts.onStatus ?? (() => {});
 
+  const nComponents = opts.nComponents ?? 2;
+
   const positions = device.createBuffer({
-    size: N * 8,
+    size: N * 4 * nComponents,
     // STORAGE for the demo's bounds reduce, VERTEX so the renderer can bind it
     // directly, COPY_DST for the upload, COPY_SRC for banking into the history.
     usage:
@@ -142,6 +146,7 @@ export async function druidCPU(
       N,
       D,
       variant: opts.variant ?? "pacmap",
+      nComponents,
       nNeighbors: opts.nNeighbors ?? 10,
       mnRatio: opts.mnRatio ?? 0.5,
       fpRatio: opts.fpRatio ?? 2.0,
@@ -155,7 +160,7 @@ export async function druidCPU(
   onStatus(`druid setup (kNN + pairs) ${ready.setupMs | 0}ms`);
 
   /** The last frame uploaded, so `read()` needs no readback either. */
-  let last = new Float32Array(N * 2);
+  let last = new Float32Array(N * nComponents);
   /** Where the worker's stream has got to, to catch an out-of-order caller. */
   let at = 0;
 

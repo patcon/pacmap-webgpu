@@ -48,9 +48,11 @@ let dr: PaCMAP<Matrix> | LocalMAP<Matrix> | null = null;
 let steps: Generator<Matrix, Matrix, void> | null = null;
 let it = 0;
 let N = 0;
+let d = 2;
 
 function init(cmd: DruidInitCommand): void {
   N = cmd.N;
+  d = cmd.nComponents;
   const { X, D } = cmd;
 
   // f32 in, f64 out: druid computes in f64 throughout, so this widening happens
@@ -83,9 +85,10 @@ function step(to: number): void {
     it++;
   }
 
-  // Narrow to f32 for the vertex buffer. d is 2, so `values` is exactly N*2.
+  // Narrow to f32 for the vertex buffer. `values` is exactly N*d, packed the
+  // same way the renderer's vertex layout expects.
   const values = dr.Y.values;
-  const Y = new Float32Array(N * 2);
+  const Y = new Float32Array(N * d);
   for (let k = 0; k < Y.length; k++) Y[k] = values[k];
 
   ctx.postMessage({ type: "frame", it, Y }, [Y.buffer]);

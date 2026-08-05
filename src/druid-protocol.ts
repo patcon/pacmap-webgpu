@@ -35,6 +35,8 @@ export interface DruidParams {
 
 export interface DruidRunOptions {
   variant: DruidVariant;
+  /** Embedding width, druid's `d`. Same meaning as the library's nComponents. */
+  nComponents: number;
   nNeighbors: number;
   mnRatio: number;
   fpRatio: number;
@@ -65,7 +67,7 @@ export function buildDruidParams(o: DruidRunOptions): DruidParams {
     n_neighbors: o.nNeighbors,
     MN_ratio: o.mnRatio,
     FP_ratio: o.fpRatio,
-    d: 2,
+    d: o.nComponents,
     num_iters: [...o.phases],
     apply_pca: false,
     knn: null,

@@ -225,6 +225,7 @@ async function go() {
       engine === "cpu"
         ? await druidCPU(device, Z, N, 100, {
             variant,
+            nComponents,
             signal: abort.signal,
             seed: params.seed,
             lowDistThres: params.lowDistThres,
@@ -1064,7 +1065,7 @@ const COMPONENT_OPTIONS: Record<string, Components> = { "2D": 2, "3D": 3 };
 // shaders and the vertex layout are all sized from it before the first
 // iteration, so it is read at the top of `go()` and the folder is disabled for
 // the duration of the run.
-const componentsBinding = pacmapFolder
+pacmapFolder
   .addBinding(params, "nComponents", {
     label: "components",
     options: COMPONENT_OPTIONS,
@@ -1096,18 +1097,6 @@ function syncComponents(d: Components) {
 function syncAlgorithm(key: AlgoKey) {
   lowDistBinding.disabled = VARIANT_OF[key] === "pacmap";
   knnBinding.disabled = ENGINE_OF[key] === "cpu";
-  // The CPU engine is 2D-only for now — druid takes an `n_components` and this
-  // demo has yet to pass it one. Greying the control is the honest form of
-  // that; leaving it live would let a run be asked for 3D and quietly given a
-  // plane. Forced back rather than merely disabled, since the value would
-  // otherwise survive a switch made while 3D was selected.
-  const cpu = ENGINE_OF[key] === "cpu";
-  componentsBinding.disabled = cpu;
-  if (cpu && params.nComponents !== 2) {
-    params.nComponents = 2;
-    componentsBinding.refresh();
-    syncComponents(2);
-  }
   updateSampleLabel();
 }
 

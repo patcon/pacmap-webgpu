@@ -132,20 +132,24 @@ unoptimized one of 3e-5.
       - [ ] **Browser (yours):** occlusion on — near clusters hide far ones, no dark
             streaks; off — back to the blended haze; 2D unaffected and greyed
 
-- [ ] **5. 3D on the druid CPU engine** — M — deps: 2
+- [x] **5. 3D on the druid CPU engine** — M — deps: 2
       `src/druid-protocol.ts`, `src/druid-worker.ts`, `src/druid-cpu.ts`,
       `scripts/check-druid.ts`
-      - [ ] `nComponents` threaded through `DruidCpuOptions` → init command →
+      - [x] `nComponents` threaded through `DruidCpuOptions` → init command →
             `buildDruidParams` (replaces the hard-coded `d: 2`)
-      - [ ] Worker snapshot `Float32Array(N*d)`; `positions` buffer `N*4*d`; `read()`
+      - [x] Worker snapshot `Float32Array(N*d)`; `positions` buffer `N*4*d`; `read()`
             fallback likewise
-      - [ ] `check:druid` case at `d: 3`: output length `N*3`, finite, blob separation
-            holds in 3-d — the case that proves `d` is *forwarded*, not just spelled right
-      - [ ] Assertion demonstrated failing first (hard-code `d: 2` back)
-      - [ ] Browser: `LocalMAP (CPU - druid)` at 3D, 500 points, renders and scrubs
+      - [x] `check:druid` case at `d: 3`: output length `N*3`, finite, blob separation
+            generalized to d — the case that proves `d` is *forwarded*, not just spelled
+            right (20 checks)
+      - [x] Demonstrated failing first: hard-coding `d: 2` back leaves 400 non-finite
+            values and a NaN spread, tripping all three
+      - [x] The Task 3 clamp is lifted — `components` is live under every engine now
+      - [ ] **Browser (yours):** `LocalMAP (CPU - druid)` at 3D, 500 points, renders
+            and scrubs
 
-### ⬜ Checkpoint: Full
-- [ ] All four checks green
+### ⬜ Checkpoint: Full (headless half done)
+- [x] All four checks green — build, shaders 11, kernels 41, druid 20
 - [ ] One run per engine × dimensionality (8 combinations) confirmed in the browser
 - [ ] Stop mid-run on a CPU 3D run keeps its partial trace
 
