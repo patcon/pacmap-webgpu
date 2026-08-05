@@ -1,146 +1,113 @@
-# TODO: CPU comparison algorithms via DruidJS
+# TODO: 3D embeddings — a `components` control (2D / 3D)
 
 Full detail, rationale, and acceptance criteria in [plan.md](plan.md).
-One commit per task, straight to `main`. Gates after every task: `npm run build`, plus
-`npm run check:druid` once Task 1 lands.
+One commit per task, straight to `main`. Gates after every task: `npm run build`, plus the
+checks named on the task. `npm run check:ab` on a clean tree must print exactly **0**
+throughout — the 2D path is meant to come out bit-identical.
 
-## Phase 1 — Foundation
+## Phase 1 — Foundation (headless, nothing user-visible)
 
-- [x] **1. Dependency + headless check (`check:druid`)** — S — deps: none
-      `package.json`, `scripts/check-druid.ts`, `.github/workflows/pages.yml`
-      - [x] `@saehrimnir/druidjs` added; `check:druid` script (esbuild → node, no Dawn)
-      - [x] Synthetic 4-blob dataset (400 points, 20-d)
-      - [x] Asserts: N×2 and finite, both classes
-      - [x] Asserts: fixed seed reproduces bit-for-bit
-      - [x] Asserts: PaCMAP ≠ LocalMAP at one seed
-      - [x] Asserts: params are *read* — `n_neighbors` and `seed` each moved separately
-            (the one that catches an option name druid silently ignores)
-      - [x] Asserts: mean intra-blob 2-d distance < inter-blob
-      - [x] Each assertion demonstrated failing before being trusted green
-      - [x] Added to the CI `gpu` job — a behaviour check, so it reports rather than
-            gating the page deploy, same as the other two
+- [x] **1. Widen bounds to a fixed 32 bytes** — S — deps: none
+      `src/shaders.ts`, `src/main.ts`, `scripts/check-kernels.ts`, `tasks/`
+      - [x] `boundsWGSL`: `sLo`/`sHi` become `vec4<f32>`; reduce writes `B[0..7]`, z/w = 0
+      - [x] `struct Bounds { lo : vec4<f32>, hi : vec4<f32> }`; vertex reads `.xyz`
+      - [x] `BOUNDS_BYTES = 32` replaces every literal `16` (buffers, history slot stride,
+            staging readback, `copyBufferToBuffer` sizes)
+      - [x] `readSeedBounds()` requires length 8; a stale 4-length entry is ignored
+      - [x] **New:** `check:kernels` gains a `bounds/*` section — the reduce had no
+            behaviour check at all, only compilation. Oracle is a CPU min/max; output
+            buffer is poison-filled so an unwritten word is a mismatch
+      - [x] Spike fixtures at indices 0/1/255/256/257/512/1999 rather than one random
+            input: a wrong grid stride drops one index class and random extremes are
+            almost never in it
+      - [x] Both mutations demonstrated failing first — stride `256u`→`257u` trips
+            `spike-at-256`; reduction tree `128u`→`64u` trips `spike-at-255`, `-1999`
+            and `grid-stride`
+      - [x] `check:shaders`, `check:kernels` (25), `check:druid` (17) green
+      - [x] `check:ab` vs. `HEAD` prints 0 — bit-identical, the library is untouched
+      - [ ] **Browser (yours):** a run looks identical, `auto zoom` on and off
 
-### ✅ Checkpoint: Foundation
-- [x] `npm run check:druid` green — 11 checks
-- [x] Misspelling `n_neighbors` trips the params assertion (`agree to 0.00e+0`)
+- [ ] **2. `nComponents` in the library** — L — deps: 1
+      `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`, `scripts/check-kernels.ts`
+      - [ ] `PacmapOptions.nComponents?: 2 | 3`, default 2 (note: `D` is the *input* dim)
+      - [ ] `alias V` + `const DIM` + `ld(i)` in `shaderSource` and `fpShaderSource`;
+            every `vec2<f32>(Y[...])` becomes `ld(...)`, zero-init becomes `V()`
+      - [ ] Gradient stores emitted per component; `adam_main` loop bound `DIM`
+      - [ ] `Y0`, `gradBuf`, `mBuf`, `vBuf`, `read()` staging sized `N*d`
+      - [ ] `EmbeddingRun.positions` doc says `N x d`
+      - [ ] `check-shaders.ts` case table iterates `d ∈ {2, 3}`
+      - [ ] `check-kernels.ts` runs resample/reverse at `d = 3`; on-a-line fixture keeps
+            y = z = 0 so its "within thres = within ten indices" invariant survives
+      - [ ] New genuinely-3D kernel case: candidate inside thres in x/y, outside via z
+      - [ ] Host distance oracle uses all `d` components
+      - [ ] Each new assertion demonstrated failing first (e.g. drop z from `ld`)
+      - [ ] `check:ab -- <pre-task-ref>` prints 0 for `--variant=pacmap` *and*
+            `--variant=localmap`
 
-Measured while landing this, and worth carrying into Task 3's cost estimate:
-450 iterations at N=400 cost **156ms** (PaCMAP) / **209ms** (LocalMAP), and the
-blob separation ratio sits at **0.055 / 0.122** against a 0.5 threshold, with a
-scrambled layout scoring 1.004 — the gate has room on both sides.
+### ⬜ Checkpoint: Foundation
+- [ ] `build`, `check:shaders`, `check:kernels`, `check:druid` all green
+- [ ] `check:ab` proves the 2D path unmoved on both variants
+- [ ] Library computes in 3D; nothing draws it yet
 
-## Phase 2 — The backend
+## Phase 2 — The renderer
 
-- [x] **2. Worker + adapter, wired end to end** — M — deps: 1
+- [ ] **3. Renderer + pane dropdown + camera mode** — L — deps: 2
+      `src/shaders.ts`, `src/main.ts`
+      - [ ] `renderWGSL(d)`: `@location(0) p : vec2/vec3<f32>`, world built per dim
+      - [ ] Quad expansion unchanged — radius stays screen-constant under zoom
+      - [ ] Pipeline `arrayStride: 4*d` / `float32x{d}`; `frameBytes = N * 4 * d`
+      - [ ] `N x 2` / 520KB history comment updated (frames are 50% larger in 3D)
+      - [ ] `components` dropdown in `dimensional reduction`, options annotated
+            `Record<string, 2 | 3>`; seeded from `?dims=`; read at the top of `go()`
+      - [ ] `setCameraMode(d)`: `enableRotate = d === 3`, `mouseButtons` swaps between the
+            2D remap and ogl's defaults; called from the dropdown and from `go()`
+      - [ ] The two "the 3D step does X" comments on the camera updated to describe what
+            it now does
+      - [ ] Browser: 3D at 2k — left-drag orbits, right-drag pans, wheel zooms,
+            double-click resets, scrubbing replays and still rotates
+      - [ ] Browser: back to 2D — left-drag pans again, old framing intact
+
+### ⬜ Checkpoint: 3D renders
+- [ ] End-to-end 3D on the GPU engine, both mouse mappings confirmed by hand
+
+## Phase 3 — Depth and the second engine
+
+- [ ] **4. Depth occlusion + toggle** — M — deps: 3
+      `src/shaders.ts`, `src/main.ts`
+      - [ ] `depth24plus` texture created in `resize()`, old one destroyed
+      - [ ] Second pipeline with `depthWriteEnabled: true`, `depthCompare: "less"`;
+            `encodeRender` picks it and attaches the depth view (`clear`, 1.0)
+      - [ ] `occlude` flag in the `View` uniform's existing pad slot; when set the
+            fragment hard-discards outside the disc and returns alpha 1.0 — no
+            semi-transparent fragment ever writes depth (the dark-streak failure mode)
+      - [ ] `view.occlusion` checkbox, default on, greyed in 2D
+      - [ ] `check:shaders` builds both render pipelines at both dims
+      - [ ] Browser: occlusion on — near clusters hide far ones, no dark streaks; off —
+            back to the blended haze; 2D unaffected
+
+- [ ] **5. 3D on the druid CPU engine** — M — deps: 2
       `src/druid-protocol.ts`, `src/druid-worker.ts`, `src/druid-cpu.ts`,
-      `src/pacmap-webgpu.ts`, `src/main.ts`, `scripts/check-druid.ts`
-      - [x] Worker: `init` builds a **`Matrix`** (not `Float64Array[]` — see below),
-            constructs the class, calls `check_init()` explicitly, holds
-            `generator(450)`, posts `ready`
-      - [x] Worker: `step { to }` pulls to `to`, flattens `dr.Y.values` → `Float32Array`,
-            posts it **transferred**
-      - [x] Worker: drives `generator()`, not bare `next()` — that is what releases the
-            WASM buffers
-      - [x] Params mapped in `druid-protocol.ts`, shared with the check so a typo there
-            fails CI rather than the browser
-      - [x] `druidCPU()` owns a `STORAGE | VERTEX | COPY_DST | COPY_SRC` buffer;
-            `runRange` uploads via `writeBuffer` — never a readback
-      - [x] `EmbeddingRun` added as the async-capable supertype; `PacmapRun` extends it
-            and re-narrows to `void`, so the GPU contract is unchanged rather than
-            widened (deviation from the plan, which said to widen `PacmapRun` itself)
-      - [x] Run loop awaits `pm.runRange(...)`
-      - [x] `destroy()` terminates the worker; worker `onerror`/`onmessageerror`/thrown
-            errors all reach `onStatus` instead of hanging the first await
-      - [x] `?algo=pacmap-cpu` / `?algo=localmap-cpu` select the engine; bare
-            `pacmap`/`localmap` still mean the GPU pair
+      `scripts/check-druid.ts`
+      - [ ] `nComponents` threaded through `DruidCpuOptions` → init command →
+            `buildDruidParams` (replaces the hard-coded `d: 2`)
+      - [ ] Worker snapshot `Float32Array(N*d)`; `positions` buffer `N*4*d`; `read()`
+            fallback likewise
+      - [ ] `check:druid` case at `d: 3`: output length `N*3`, finite, blob separation
+            holds in 3-d — the case that proves `d` is *forwarded*, not just spelled right
+      - [ ] Assertion demonstrated failing first (hard-code `d: 2` back)
+      - [ ] Browser: `LocalMAP (CPU - druid)` at 3D, 500 points, renders and scrubs
 
-**Two findings worth keeping.** Druid's `generator()` yields `this.projection`, and
-for a `Float64Array[]` input that getter calls `to2dArray()` — N fresh arrays on
-every one of the 450 iterations, all discarded, ~29M allocations at 65k. Passing a
-`Matrix` makes `projection` return `this.Y` by reference. And `check:druid` now
-proves the two decisions this rests on are behaviour-preserving:
-`worker/chunked-generator-matches-transform` (uneven strides, bit-for-bit against
-`transform()`) and `worker/matrix-input-matches-rows`.
+### ⬜ Checkpoint: Full
+- [ ] All four checks green
+- [ ] One run per engine × dimensionality (8 combinations) confirmed in the browser
+- [ ] Stop mid-run on a CPU 3D run keeps its partial trace
 
-- [x] **3. Four-way dropdown and the cost hint** — S — deps: 2
-      `src/main.ts`
-      - [x] `params.algorithm: AlgoKey` replaces `params.variant`/`params.engine`,
-            options map still annotated `Record<string, AlgoKey>` (a typo'd value must
-            stay a build error)
-      - [x] Labels: `PaCMAP (GPU - custom)`, `LocalMAP (GPU - custom)`,
-            `PaCMAP (CPU - druid)`, `LocalMAP (CPU - druid)`
-      - [x] `?algo=` takes the four keys; `pacmap`/`localmap` remain GPU aliases
-      - [x] `kNN algo` disabled under a CPU engine; `low_dist_thres` live for `localmap-cpu`
-      - [x] `estimateSetupSecs` takes an engine; hint refreshes on dropdown change and
-            reads "run (CPU)" rather than "setup", since under druid the optimizer is
-            no longer the free part
-      - [x] Status line names the engine alongside the variant (via the label)
-      - [x] Folder retitled `dimensional reduction` (was `algorithm · next run`).
-            Note this drops the "next run" signal; the folder still greys out mid-run,
-            which is what actually communicates it.
+## Phase 4 — Documentation
 
-**The cost model is measured, not derived.** Druid at D=100 over N=500…4000:
-**8.5e-8 s/N²** for the exact neighbour search and **2.7e-4 s/point** for all 450
-iterations. That puts N=65000 at **~7 min**, not the "minutes-to-hours" the plan
-assumed from asymptotics alone — the search is WASM-accelerated, which the
-O(N²·D) reading misses. Extrapolating a quadratic four-fold deserves distrust, so
-the hint is an order of magnitude, not a prediction.
-
-### Checkpoint: Core
-- [ ] All four algorithms animate at N=2000
-- [ ] Scrubbing and replay identical across engines
-- [ ] `npm run check:ab` prints exactly 0 on a clean tree *first*, then confirms the GPU
-      output is unchanged from `main`
-
-## Phase 3 — Polish
-
-- [x] **4. Abort, so a long CPU run is recoverable** — S — deps: 3
-      `src/main.ts`, `src/druid-cpu.ts`
-      - [x] Start becomes Stop mid-run, driven by an `AbortController`
-      - [x] `DruidCpuOptions.signal` terminates the worker — needed because druid's
-            neighbour search is one synchronous call owning the worker for minutes,
-            so no cooperative check can run during the longest phase
-      - [x] Stop honoured after PCA too, before committing to a minutes-long setup
-      - [x] A stop mid-step rejects the in-flight `runRange`; caught and broken out of
-            rather than thrown past the playback setup, so the banked trace survives
-      - [x] Playback bounded by `banked` (frames actually captured) rather than the
-            planned `frameCount`; scrubber, readout and loop-around all follow it
-      - [x] Status reports `stopped at N of 450`
-      - [x] `pm.destroy()` on stop only — see below
-
-**Deliberately not done:** `pm.destroy()` for runs that *finish*. It would free the
-run's buffers, which currently live until the next run replaces them, but that is a
-change to the path someone is looking at when the layout settles, and this change had
-no browser to confirm it in. Left as a known, sited improvement.
-
-**Untested here:** every acceptance criterion in this task is a browser behaviour.
-The build and all four checks are green, but no stop has actually been clicked.
-
-- [x] **5. Document it** — S — deps: 4
-      `CLAUDE.md`
-      - [x] `check:druid` in the commands block and in the checks-at-different-levels
-            paragraph — "the four sit at different levels"; it covers a level the other
-            three do not, and is the one needing no GPU
-      - [x] New section on the three druid files: `EmbeddingRun`, the Matrix-vs-rows
-            and `generator()`-vs-`next()` decisions, the param-mapping hazard
-      - [x] CPU backend deviations: PCA init vs Gaussian (so the engines disagree at a
-            shared seed), druid's own exact kNN, f64 vs f32, upload-per-frame rather
-            than readback
-      - [x] Measured cost coefficients and what the slider hint extrapolates from
-      - [x] Stop button: why a cooperative check cannot implement it
-      - [x] LGPL-3.0-or-later note on the dependency
-      - [x] Stale passages corrected, not just additions: folder retitled, options map
-            now `Record<string, AlgoKey>`, Tweakpane no longer "the only runtime
-            dependency", intro and pipeline list mention four algorithms, playback
-            bounded by `banked`, and the known-coverage-gap paragraph now names two
-
-### ✅ Checkpoint: Complete
-- [x] `npm run build`, `check:shaders` (6), `check:kernels` (16), `check:druid` (17)
-      all clean; `check:ab` bit-identical on both variants
-- [x] Five commits on `main`, one per task
-
-### Still open — browser only
-- [ ] Task 4's stop behaviours: stop during druid setup (the case a cooperative check
-      would miss), stop mid-optimize, scrubber over the partial trace, no orphaned
-      worker afterwards
-- [ ] The four-way dropdown and cost hint exercised across all four entries
+- [ ] **6. `CLAUDE.md` + `README.md`** — S — deps: 5
+      - [ ] New Architecture subsection: the `alias V`/`ld()` scheme vs. a component loop,
+            the fixed 32-byte bounds and why `vec3` padding makes it free, occlusion over
+            sorting (a CPU depth sort would mean a per-frame readback), the camera's three
+            2D flags now mode-switched rather than fixed
+      - [ ] Coverage-gaps paragraph updated: the camera gap now covers rotation and the
+            occlusion toggle too

@@ -7,21 +7,25 @@
 
 export const boundsWGSL = (N: number) => /* wgsl */ `
 @group(0) @binding(0) var<storage, read>       Y : array<f32>;
-@group(0) @binding(1) var<storage, read_write> B : array<f32>;  // loX loY hiX hiY
+@group(0) @binding(1) var<storage, read_write> B : array<f32>;  // lo.xyzw hi.xyzw
 
 const N : u32 = ${N}u;
-var<workgroup> sLo : array<vec2<f32>, 256>;
-var<workgroup> sHi : array<vec2<f32>, 256>;
+// vec4 rather than vec2 because the box is eight floats at either
+// dimensionality — see struct Bounds below for why that costs nothing. The
+// unused components carry 0 through the reduce rather than the sentinel, so
+// they land as 0 in the output instead of +-1e30.
+var<workgroup> sLo : array<vec4<f32>, 256>;
+var<workgroup> sHi : array<vec4<f32>, 256>;
 
 // Single workgroup, grid-stride over all points. Keeps autoscaling on the GPU
 // so the render loop never has to read positions back to the host.
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
   let t = lid.x;
-  var lo = vec2<f32>( 1e30,  1e30);
-  var hi = vec2<f32>(-1e30, -1e30);
+  var lo = vec4<f32>( 1e30);
+  var hi = vec4<f32>(-1e30);
   for (var i : u32 = t; i < N; i = i + 256u) {
-    let p = vec2<f32>(Y[2u * i], Y[2u * i + 1u]);
+    let p = vec4<f32>(Y[2u * i], Y[2u * i + 1u], 0.0, 0.0);
     lo = min(lo, p);
     hi = max(hi, p);
   }
@@ -36,14 +40,18 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
     workgroupBarrier();
   }
   if (t == 0u) {
-    B[0] = sLo[0].x; B[1] = sLo[0].y;
-    B[2] = sHi[0].x; B[3] = sHi[0].y;
+    B[0] = sLo[0].x; B[1] = sLo[0].y; B[2] = sLo[0].z; B[3] = sLo[0].w;
+    B[4] = sHi[0].x; B[5] = sHi[0].y; B[6] = sHi[0].z; B[7] = sHi[0].w;
   }
 }
 `;
 
 export const renderWGSL = /* wgsl */ `
-struct Bounds { lo : vec2<f32>, hi : vec2<f32> };
+// 32 bytes. vec4 rather than vec3 because a vec3 in a uniform pads to 16 bytes
+// anyway, so the padded form is free — and it keeps one buffer size, one
+// history slot stride and one sessionStorage schema across the 2D/3D switch,
+// instead of a layout that changes with a dropdown.
+struct Bounds { lo : vec4<f32>, hi : vec4<f32> };
 // 80 bytes: mat4 64 + vec2 8 + f32 4 + pad 4. viewProj already carries the
 // WebGL-to-WebGPU depth remap (see resize() in main.ts), so it is used as-is.
 struct View   { viewProj : mat4x4<f32>, res : vec2<f32>, radius : f32, _pad : f32 };
@@ -84,9 +92,10 @@ fn vs(
   // bounds reduce keeps doing the framing and the camera only moves when the
   // user moves it. z is 0 while the embedding is 2D; the 3D step feeds it a
   // third component and nothing else here changes.
-  let ctr  = (B.lo + B.hi) * 0.5;
-  let span = max(max(B.hi.x - B.lo.x, B.hi.y - B.lo.y), 1e-6);
-  let w = vec3<f32>((p - ctr) / (span * 0.55), 0.0);
+  let ctr  = (B.lo.xyz + B.hi.xyz) * 0.5;
+  let ext  = B.hi.xyz - B.lo.xyz;
+  let span = max(max(max(ext.x, ext.y), ext.z), 1e-6);
+  let w = vec3<f32>((p - ctr.xy) / (span * 0.55), 0.0);
   // The projection owns the aspect divide now, so there is none here.
   var clip = V.viewProj * vec4<f32>(w, 1.0);
 

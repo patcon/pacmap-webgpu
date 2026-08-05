@@ -27,6 +27,7 @@
  */
 
 import { pacmapWebGPU, shaderSources } from "../src/pacmap-webgpu";
+import { boundsWGSL } from "../src/shaders";
 import { openDawn, upload, readback, rng } from "./dawn";
 
 const STRICT = process.argv.includes("--strict");
@@ -409,6 +410,114 @@ async function checkResample(device: GPUDevice): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// The autoscale bounds reduce
+//
+// The demo's kernel rather than the library's, but the same argument applies:
+// `check:shaders` proves it compiles, and a reduce that compiles can still lose
+// a tail of points to a bad grid stride or leave part of its output unwritten —
+// which shows up as a frame that is framed slightly wrong, not as an error.
+//
+// It writes a fixed eight floats (lo.xyzw, hi.xyzw) at either dimensionality.
+// A `vec3` in a uniform pads to 16 bytes anyway, so the padded layout costs
+// nothing and keeps one slot stride, one staging size and one sessionStorage
+// schema across the 2D/3D switch.
+// ---------------------------------------------------------------------------
+
+const BOUNDS_FLOATS = 8;
+
+async function boundsCase(
+  device: GPUDevice,
+  name: string,
+  N: number,
+  Y: Float32Array
+): Promise<void> {
+  const module = device.createShaderModule({ code: boundsWGSL(N) });
+  const pipe = device.createComputePipeline({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+  // Poison-filled: a word the reduce never writes must read as a mismatch
+  // rather than as a plausible zero.
+  const out = upload(
+    device,
+    new Float32Array(BOUNDS_FLOATS).fill(-1234.5),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+  );
+  const bindGroup = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: upload(device, Y, GPUBufferUsage.STORAGE) } },
+      { binding: 1, resource: { buffer: out } },
+    ],
+  });
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipe);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  // `readback` hands back words; these are floats.
+  const got = new Float32Array((await readback(device, out, BOUNDS_FLOATS * 4)).buffer);
+
+  // min/max move no bits, so the oracle can be compared exactly.
+  const want = new Float32Array(BOUNDS_FLOATS);
+  for (let c = 0; c < 2; c++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < N; i++) {
+      const v = Y[2 * i + c];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    want[c] = lo;
+    want[4 + c] = hi;
+  }
+  // The unused axes are written, not left alone: the render's `span` maxes over
+  // all three, so a stale word there would resize the frame.
+
+  const bad: string[] = [];
+  for (let k = 0; k < BOUNDS_FLOATS; k++) {
+    if (got[k] !== want[k]) bad.push(`[${k}] want ${want[k]} got ${got[k]}`);
+  }
+  check(`bounds/${name}`, bad.length === 0, bad.join(", "));
+}
+
+async function checkBounds(device: GPUDevice): Promise<void> {
+  {
+    // Several grid-stride passes per thread, with negative coordinates so a
+    // zero-initialized accumulator cannot pass by accident.
+    const N = 2000;
+    const r = rng(21);
+    const Y = new Float32Array(N * 2).map(() => r() * 20 - 10);
+    await boundsCase(device, "grid-stride", N, Y);
+  }
+  {
+    // Fewer points than threads: most of the workgroup contributes nothing and
+    // must not drag the result to its sentinel.
+    const N = 37;
+    const r = rng(22);
+    const Y = new Float32Array(N * 2).map(() => r() * 4 + 100);
+    await boundsCase(device, "fewer-than-workgroup", N, Y);
+  }
+  // One point carrying both extremes, walked across the indices where a reduce
+  // loses points: the ends, and either side of the 256-wide workgroup. A single
+  // random fixture cannot catch this — a wrong grid stride drops one index class
+  // (257u instead of 256u drops i = 256, 513, ...) and random extremes are
+  // almost never in it. Parking the only extreme *at* such an index is what
+  // makes the coverage of the loop checkable rather than assumed.
+  for (const k of [0, 1, 255, 256, 257, 512, 1999]) {
+    const N = 2000;
+    const Y = new Float32Array(N * 2);
+    Y[2 * k] = -999;
+    Y[2 * k + 1] = 999;
+    await boundsCase(device, `spike-at-${k}`, N, Y);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------
 
@@ -495,6 +604,7 @@ async function main(): Promise<number> {
   try {
     await checkReverseCsr(session.device);
     await checkResample(session.device);
+    await checkBounds(session.device);
     await checkEndToEnd(session.device);
   } finally {
     session.close();

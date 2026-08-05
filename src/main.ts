@@ -88,11 +88,16 @@ const KNN_CHECK = qs.get("knncheck") === "1";
 const HISTORY_BUDGET_BYTES = 128 << 20;
 const PLAYBACK_FPS = 60;
 
+// The framing box: `lo.xyzw hi.xyzw`, one size at either dimensionality (see
+// `struct Bounds` in shaders.ts). Every buffer, history slot and copy that
+// carries a box is measured in this rather than in a literal.
+const BOUNDS_BYTES = 32;
+
 // With auto zoom off the whole trace is framed by one box, and during a live run
 // the box that frames the *final* frame is not yet known. The previous run's is
 // the best guess available, so it is carried across runs and page reloads. Same
-// `loX loY hiX hiY` layout the bounds shader writes, so it drops straight into
-// the render's bounds uniform.
+// layout the bounds shader writes, so it drops straight into the render's
+// bounds uniform.
 const BOUNDS_KEY = "pacmap:lastBounds";
 let seedBounds: Float32Array<ArrayBuffer> | null = readSeedBounds();
 
@@ -102,7 +107,10 @@ function readSeedBounds(): Float32Array<ArrayBuffer> | null {
     const raw = sessionStorage.getItem(BOUNDS_KEY);
     if (!raw) return null;
     const v = JSON.parse(raw);
-    if (!Array.isArray(v) || v.length !== 4) return null;
+    // An entry written before the box widened is simply ignored; the run it
+    // would have seeded falls back to auto zoom, which is already the
+    // first-run-of-a-session behaviour.
+    if (!Array.isArray(v) || v.length !== BOUNDS_BYTES / 4) return null;
     if (!v.every((x) => typeof x === "number" && Number.isFinite(x))) return null;
     return new Float32Array(v);
   } catch {
@@ -238,11 +246,11 @@ async function go() {
     labelBuf.unmap();
 
     const boundsStorage = device.createBuffer({
-      size: 16,
+      size: BOUNDS_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
     const boundsUniform = device.createBuffer({
-      size: 16,
+      size: BOUNDS_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // 80 bytes: viewProj mat4, res vec2, radius, pad. See `struct View`.
@@ -271,7 +279,7 @@ async function go() {
     // The autoscale bounds are banked alongside the positions rather than
     // recomputed on scrub, so a replayed frame is framed exactly as it was live.
     const boundsHistory = device.createBuffer({
-      size: frameCount * 16,
+      size: frameCount * BOUNDS_BYTES,
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -450,11 +458,17 @@ async function go() {
       cp.setBindGroup(0, boundsBG);
       cp.dispatchWorkgroups(1);
       cp.end();
-      // Banked unconditionally: 16 bytes, and toggling auto zoom back on mid-run
+      // Banked unconditionally: 32 bytes, and toggling auto zoom back on mid-run
       // has to find a bound for every slot behind it.
-      enc.copyBufferToBuffer(boundsStorage, 0, boundsHistory, slot * 16, 16);
+      enc.copyBufferToBuffer(
+        boundsStorage,
+        0,
+        boundsHistory,
+        slot * BOUNDS_BYTES,
+        BOUNDS_BYTES
+      );
       if (view.autoZoom || !seedBounds) {
-        enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, 16);
+        enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, BOUNDS_BYTES);
       } else {
         // Held fixed, but the final frame's bound doesn't exist yet — the
         // previous run's is the only guess there is. Ordered against the submit
@@ -480,7 +494,13 @@ async function go() {
       // camera that cancels it out.
       const boundsSlot = view.autoZoom ? slot : banked - 1;
       const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(boundsHistory, boundsSlot * 16, boundsUniform, 0, 16);
+      enc.copyBufferToBuffer(
+        boundsHistory,
+        boundsSlot * BOUNDS_BYTES,
+        boundsUniform,
+        0,
+        BOUNDS_BYTES
+      );
       encodeRender(enc, posHistory, slot * frameBytes);
       device.queue.submit([enc.finish()]);
     }
@@ -553,11 +573,17 @@ async function go() {
     // run after a 65k one isn't stuck with a view sized for the big one.
     {
       const staging = device.createBuffer({
-        size: 16,
+        size: BOUNDS_BYTES,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
       });
       const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(boundsHistory, (banked - 1) * 16, staging, 0, 16);
+      enc.copyBufferToBuffer(
+        boundsHistory,
+        (banked - 1) * BOUNDS_BYTES,
+        staging,
+        0,
+        BOUNDS_BYTES
+      );
       device.queue.submit([enc.finish()]);
       await staging.mapAsync(GPUMapMode.READ);
       const last = new Float32Array(staging.getMappedRange().slice(0));
