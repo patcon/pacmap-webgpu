@@ -44,6 +44,10 @@ const NFP = 20;
 
 const STRICT = process.argv.includes("--strict");
 
+// Must match main.ts: the pipeline's depth state and the attachment's texture
+// format are validated against each other at draw time.
+const DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
+
 type Case = {
   name: string;
   code: string;
@@ -168,8 +172,13 @@ const cases: Case[] = [
       });
     },
   },
-  ...DIMS.map((d) => ({
-    name: `render-${d}d`,
+  // The 3D renderer builds a second pipeline for the occlusion toggle, and
+  // depth state is baked into a pipeline rather than set at draw time — so
+  // both have to be built here. A depth format the device rejects, or a
+  // fragment that stopped writing the target, fails only at this call.
+  ...DIMS.flatMap((d) =>
+    (d === 3 ? [false, true] : [false]).map((depth) => ({
+    name: `render-${d}d${depth ? "-depth" : ""}`,
     code: renderWGSL(d),
     build: (device: GPUDevice, module: GPUShaderModule) => {
       device.createRenderPipeline({
@@ -222,9 +231,19 @@ const cases: Case[] = [
           ],
         },
         primitive: { topology: "triangle-list" as const },
+        ...(depth
+          ? {
+              depthStencil: {
+                format: DEPTH_FORMAT,
+                depthWriteEnabled: true,
+                depthCompare: "less" as const,
+              },
+            }
+          : {}),
       });
     },
-  })),
+    }))
+  ),
 ];
 
 async function main(): Promise<number> {

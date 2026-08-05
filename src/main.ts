@@ -99,6 +99,10 @@ const PLAYBACK_FPS = 60;
 // carries a box is measured in this rather than in a literal.
 const BOUNDS_BYTES = 32;
 
+// Occlusion's depth attachment. Must match the format the pipeline's depth
+// state declares, which check-shaders builds against the same constant.
+const DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
+
 // With auto zoom off the whole trace is framed by one box, and during a live run
 // the box that frames the *final* frame is not yet known. The previous run's is
 // the best guess available, so it is carried across runs and page reloads. Same
@@ -313,7 +317,7 @@ async function go() {
     const renderModule = device.createShaderModule({
       code: renderWGSL(nComponents),
     });
-    const renderPipe = device.createRenderPipeline({
+    const renderDesc: GPURenderPipelineDescriptor = {
       layout: "auto",
       vertex: {
         module: renderModule,
@@ -361,7 +365,37 @@ async function go() {
         ],
       },
       primitive: { topology: "triangle-list" },
-    });
+    };
+    const renderPipe = device.createRenderPipeline(renderDesc);
+    // Depth state is baked into a pipeline, so the toggle is a second pipeline
+    // rather than a flag — built only in 3D, where it is the only mode that
+    // can use it.
+    const renderPipeDepth =
+      nComponents === 3
+        ? device.createRenderPipeline({
+            ...renderDesc,
+            depthStencil: {
+              format: DEPTH_FORMAT,
+              depthWriteEnabled: true,
+              depthCompare: "less",
+            },
+          })
+        : null;
+    /**
+     * Is this frame drawn occluded?
+     *
+     * One place, because three things have to agree: which pipeline is set,
+     * whether the pass carries a depth attachment, and the `occlude` flag in
+     * the view uniform that tells the fragment to paint solid. A pipeline with
+     * depth state and a pass without an attachment is a validation error; the
+     * flag disagreeing with either is a semi-transparent fragment writing
+     * depth, which is the dark-streak failure this mode exists to avoid.
+     */
+    const occludingNow = () => renderPipeDepth !== null && view.occlusion;
+
+    let depthTex: GPUTexture | null = null;
+    let depthView: GPUTextureView | null = null;
+
     const renderBG = device.createBindGroup({
       layout: renderPipe.getBindGroupLayout(0),
       entries: [
@@ -401,8 +435,21 @@ async function go() {
       m[16] = canvas.width;
       m[17] = canvas.height;
       m[18] = radius;
-      m[19] = 0;
+      m[19] = occludingNow() ? 1 : 0;
       device.queue.writeBuffer(viewUniform, 0, m);
+
+      // Sized with the canvas, and only in 3D. Recreated rather than resized —
+      // a texture's dimensions are fixed at creation — so the old one is
+      // destroyed rather than left to the GC holding framebuffer memory.
+      if (renderPipeDepth && (depthTex?.width !== w || depthTex?.height !== h)) {
+        depthTex?.destroy();
+        depthTex = device.createTexture({
+          size: [w, h],
+          format: DEPTH_FORMAT,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        depthView = depthTex.createView();
+      }
     }
     // Point-size edits land immediately, even mid-run when nothing else is
     // rewriting the view uniform.
@@ -453,6 +500,7 @@ async function go() {
       posBuf: GPUBuffer,
       offset: number
     ) {
+      const occlude = occludingNow() && depthView !== null;
       const rp = enc.beginRenderPass({
         colorAttachments: [
           {
@@ -462,8 +510,18 @@ async function go() {
             storeOp: "store",
           },
         ],
+        ...(occlude
+          ? {
+              depthStencilAttachment: {
+                view: depthView!,
+                depthClearValue: 1,
+                depthLoadOp: "clear" as const,
+                depthStoreOp: "store" as const,
+              },
+            }
+          : {}),
       });
-      rp.setPipeline(renderPipe);
+      rp.setPipeline(occlude ? renderPipeDepth! : renderPipe);
       rp.setBindGroup(0, renderBG);
       rp.setVertexBuffer(0, posBuf, offset, frameBytes);
       rp.setVertexBuffer(1, labelBuf);
@@ -734,7 +792,10 @@ function frame(): Promise<void> {
 // `autoZoom` on is the behaviour that predates the checkbox: every frame framed
 // to its own extent. Off holds one box for the whole trace, which is what makes
 // the points' actual travel visible rather than cancelled out by the camera.
-const view = { pointSize: 1.8, autoZoom: true };
+// `occlusion` is read only in 3D (see `occludingNow` in `go()`), where it
+// decides between an opaque, depth-tested cloud and the blended haze that is
+// the only sensible thing to draw when every point is coplanar.
+const view = { pointSize: 1.8, autoZoom: true, occlusion: true };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
 let onViewChange: (() => void) | null = null;
@@ -935,6 +996,12 @@ viewFolder
 viewFolder
   .addBinding(view, "autoZoom", { label: "auto zoom" })
   .on("change", () => onViewChange?.());
+// Nothing to install here either — the flag rides in the view uniform, which
+// `resize()` rewrites on the next redraw, and `onViewChange` is what marks the
+// live phase dirty enough to have one.
+const occlusionBinding = viewFolder
+  .addBinding(view, "occlusion", { label: "occlusion" })
+  .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.
 viewFolder
   .addButton({ title: "reset camera" })
@@ -981,7 +1048,21 @@ const componentsBinding = pacmapFolder
     label: "components",
     options: COMPONENT_OPTIONS,
   })
-  .on("change", (e) => setCameraMode(e.value as Components));
+  .on("change", (e) => syncComponents(e.value as Components));
+
+/**
+ * Bring the camera and the view folder in line with the selected width.
+ *
+ * Occlusion is meaningless in 2D — every point sits on one plane, so a depth
+ * buffer would resolve ties by whatever order the buffer happens to be in —
+ * and the 2D pipeline is built without depth state at all, so the checkbox
+ * would be inert as well as pointless. Greyed rather than hidden, so it does
+ * not move the folder's other rows around.
+ */
+function syncComponents(d: Components) {
+  setCameraMode(d);
+  occlusionBinding.disabled = d === 2;
+}
 
 /**
  * Grey out what the selected engine does not read, and refresh the cost hint.
@@ -1004,7 +1085,7 @@ function syncAlgorithm(key: AlgoKey) {
   if (cpu && params.nComponents !== 2) {
     params.nComponents = 2;
     componentsBinding.refresh();
-    setCameraMode(2);
+    syncComponents(2);
   }
   updateSampleLabel();
 }
@@ -1078,7 +1159,8 @@ pacmapFolder.addBinding(params, "fpRatio", {
 pacmapFolder.addBinding(params, "seed", { min: 0, max: 999, step: 1 });
 
 // Bindings all exist now, so the pane can be brought in line with whatever
-// `?algo=` selected. Also draws the first cost hint.
+// `?algo=` and `?dims=` selected. Also draws the first cost hint.
+syncComponents(params.nComponents);
 syncAlgorithm(params.algorithm);
 
 // ---------------------------------------------------------------------------

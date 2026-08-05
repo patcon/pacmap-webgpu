@@ -99,18 +99,25 @@ unoptimized one of 3e-5.
 
 ## Phase 3 — Depth and the second engine
 
-- [ ] **4. Depth occlusion + toggle** — M — deps: 3
-      `src/shaders.ts`, `src/main.ts`
-      - [ ] `depth24plus` texture created in `resize()`, old one destroyed
-      - [ ] Second pipeline with `depthWriteEnabled: true`, `depthCompare: "less"`;
-            `encodeRender` picks it and attaches the depth view (`clear`, 1.0)
-      - [ ] `occlude` flag in the `View` uniform's existing pad slot; when set the
-            fragment hard-discards outside the disc and returns alpha 1.0 — no
-            semi-transparent fragment ever writes depth (the dark-streak failure mode)
-      - [ ] `view.occlusion` checkbox, default on, greyed in 2D
-      - [ ] `check:shaders` builds both render pipelines at both dims
-      - [ ] Browser: occlusion on — near clusters hide far ones, no dark streaks; off —
-            back to the blended haze; 2D unaffected
+- [x] **4. Depth occlusion + toggle** — M — deps: 3
+      `src/shaders.ts`, `src/main.ts`, `scripts/check-shaders.ts`
+      - [x] `depth24plus` texture created in `resize()`, sized with the canvas, old one
+            destroyed (dimensions are fixed at creation, so it is recreated not resized)
+      - [x] Second pipeline with `depthWriteEnabled: true`, `depthCompare: "less"`,
+            built only in 3D and sharing the 2D descriptor
+      - [x] `occludingNow()` is the single source for all three things that must agree:
+            which pipeline is set, whether the pass carries a depth attachment, and the
+            uniform flag. A pipeline with depth state and a pass without an attachment
+            is a validation error; the flag disagreeing with either is the dark streaks
+      - [x] `occlude` flag took the `View` uniform's existing pad slot — no size change
+      - [x] Fragment paints a solid disc when occluding, so nothing semi-transparent
+            ever writes depth. The feathered edge cannot survive that, which is
+            precisely why this is a toggle and not the only mode
+      - [x] `view.occlusion` checkbox, default on, greyed in 2D via `syncComponents`
+      - [x] `check:shaders` builds the depth pipeline (10 cases), and it was shown
+            failing first by handing it a colour format for its depth state
+      - [ ] **Browser (yours):** occlusion on — near clusters hide far ones, no dark
+            streaks; off — back to the blended haze; 2D unaffected and greyed
 
 - [ ] **5. 3D on the druid CPU engine** — M — deps: 2
       `src/druid-protocol.ts`, `src/druid-worker.ts`, `src/druid-cpu.ts`,

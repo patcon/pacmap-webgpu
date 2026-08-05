@@ -60,9 +60,10 @@ export const renderWGSL = (d = 2) => /* wgsl */ `
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
 // instead of a layout that changes with a dropdown.
 struct Bounds { lo : vec4<f32>, hi : vec4<f32> };
-// 80 bytes: mat4 64 + vec2 8 + f32 4 + pad 4. viewProj already carries the
+// 80 bytes: mat4 64 + vec2 8 + f32 4 + f32 4. viewProj already carries the
 // WebGL-to-WebGPU depth remap (see resize() in main.ts), so it is used as-is.
-struct View   { viewProj : mat4x4<f32>, res : vec2<f32>, radius : f32, _pad : f32 };
+// occlude took the slot that used to be padding — see the fragment.
+struct View   { viewProj : mat4x4<f32>, res : vec2<f32>, radius : f32, occlude : f32 };
 
 @group(0) @binding(0) var<uniform> B : Bounds;
 @group(0) @binding(1) var<uniform> V : View;
@@ -123,10 +124,29 @@ fn vs(
   return out;
 }
 
+// Two looks, because in 3D they answer different questions.
+//
+// Blended (occlude = 0): every point contributes wherever it lands, so density
+// reads directly as opacity. Correct for 2D, where the points are coplanar and
+// there is nothing to hide anything else. In 3D it is a haze — depth is
+// conveyed only by parallax as the camera moves.
+//
+// Occluded (occlude = 1): an opaque disc, so the depth buffer resolves which
+// point is in front and near clusters genuinely hide far ones. The opacity is
+// the load-bearing part, not a side effect: a semi-transparent fragment that
+// writes depth culls everything behind it while compositing against the
+// background, which is what produces dark streaks cutting through clusters
+// (observed in the sibling project's fastplotlib backend). Nothing here writes
+// depth unless it painted the pixel solid.
+//
+// The cost is a hard edge — the smoothstep feather cannot survive, since a
+// feathered edge is exactly a semi-transparent fragment — and a dense cloud
+// that stops accumulating opacity. Which is why this is a toggle.
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let d = length(in.uv);
   if (d > 1.0) { discard; }
+  if (V.occlude > 0.5) { return vec4<f32>(in.col, 1.0); }
   return vec4<f32>(in.col, (1.0 - smoothstep(0.7, 1.0, d)) * 0.85);
 }
 `;
