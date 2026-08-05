@@ -37,6 +37,7 @@ const status = (m: string) => (statusEl.textContent = m);
 //   ?algo=localmap          run LocalMAP rather than PaCMAP (default pacmap)
 //   ?algo=pacmap-cpu        run DruidJS on the CPU rather than our WGSL
 //   ?knn=gpu|nnd            pick the kNN backend (default cpu brute force)
+//   ?dims=3                 embed and render in 3D (default 2)
 //   ?knncheck=1             run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
@@ -53,6 +54,9 @@ type Engine = "gpu" | "cpu";
  * a single key keeps the dropdown one control rather than two that can disagree.
  */
 type AlgoKey = `${Variant}-${Engine}`;
+
+/** Embedding width. The dropdown's values, and the library's `nComponents`. */
+type Components = 2 | 3;
 
 const VARIANT_OF: Record<AlgoKey, Variant> = {
   "pacmap-gpu": "pacmap",
@@ -80,11 +84,13 @@ const ALGO_MODE: AlgoKey =
   : ALGO_PARAM === "localmap" ? "localmap-gpu"
   : "pacmap-gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
+const DIMS_MODE: Components = qs.get("dims") === "3" ? 3 : 2;
 
-// Playback history. Every captured frame is a full N x 2 f32 snapshot kept in
+// Playback history. Every captured frame is a full N x d f32 snapshot kept in
 // GPU memory, so the scrubber never reads positions back to the host — same
-// constraint as the live render path. At 65k points a frame is 520KB, so the
-// budget, not the iteration count, is what decides how many we keep.
+// constraint as the live render path. At 65k points a frame is 520KB in 2D and
+// 780KB in 3D, so the budget, not the iteration count, is what decides how many
+// we keep — and a 3D run banks correspondingly fewer, or strides coarser.
 const HISTORY_BUDGET_BYTES = 128 << 20;
 const PLAYBACK_FPS = 60;
 
@@ -200,6 +206,11 @@ async function go() {
     // GPU-engine concept and naming one under the CPU engine would be a lie.
     const knnLabel = engine === "cpu" ? "druid exact" : KNN_LABELS[params.knnMethod];
     const nNeighbors = params.autoNeighbors ? undefined : params.nNeighbors;
+    const nComponents = params.nComponents;
+    // Rotation is on in 3D and off in 2D, and the mouse map differs with it —
+    // set here rather than only on the dropdown so a `?dims=` load is right
+    // before anything is drawn.
+    setCameraMode(nComponents);
 
     status(
       `PCA ${tPca | 0}ms · building kNN graph (${knnLabel}) + sampling pairs…`
@@ -224,6 +235,7 @@ async function go() {
             seed: params.seed,
             knn: params.knnMethod,
             variant,
+            nComponents,
             lowDistThres: params.lowDistThres,
             nNeighbors,
             mnRatio: params.mnRatio,
@@ -264,7 +276,7 @@ async function go() {
     // One slot per captured frame, plus slot 0 for the pre-optimization init.
     // `stride` iterations are collapsed into one slot when the full trace would
     // not fit the budget, so the timeline stays complete (just coarser).
-    const frameBytes = N * 8;
+    const frameBytes = N * 4 * nComponents;
     const budget = Math.min(HISTORY_BUDGET_BYTES, device.limits.maxBufferSize);
     const maxFrames = Math.max(2, Math.floor(budget / frameBytes));
     const stride = Math.max(1, Math.ceil(pm.totalIters / (maxFrames - 1)));
@@ -298,7 +310,9 @@ async function go() {
       ],
     });
 
-    const renderModule = device.createShaderModule({ code: renderWGSL });
+    const renderModule = device.createShaderModule({
+      code: renderWGSL(nComponents),
+    });
     const renderPipe = device.createRenderPipeline({
       layout: "auto",
       vertex: {
@@ -306,9 +320,17 @@ async function go() {
         entryPoint: "vs",
         buffers: [
           {
-            arrayStride: 8,
+            // Same `d` the shader was generated with and the same one
+            // `frameBytes` is sized from; they cannot be allowed to disagree.
+            arrayStride: 4 * nComponents,
             stepMode: "instance",
-            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+            attributes: [
+              {
+                shaderLocation: 0,
+                offset: 0,
+                format: `float32x${nComponents}` as GPUVertexFormat,
+              },
+            ],
           },
           {
             arrayStride: 4,
@@ -748,49 +770,78 @@ const camera = new Camera(null as unknown as OGLRenderingContext, {
 const DEFAULT_DIST = 1 / Math.tan((FOV * Math.PI) / 360);
 camera.position.set(0, 0, DEFAULT_DIST);
 
-// Constructed once, at module scope rather than per run: `go()` already leaks a
-// window resize listener per run, harmless only because of the `gen === runGen`
-// guard, and a controller that attached its own handlers per run would stack
-// them for real.
-const orbit = new Orbit(camera, {
-  element: canvas,
-  target: new Vec3(0, 0, 0),
-  // The one thing keeping this 2D. Flipping it to true, and giving the shader a
-  // third world component, is the 3D step.
-  enableRotate: false,
-  // These two go together, and neither is right alone.
-  //
-  // Orbit's pixel-to-world conversion is exactly 1:1 already
-  // (2*d*tan(fov/2)/clientHeight, and every point sits on the target plane), so
-  // panSpeed wants to be 1 rather than the 0.1 default. But `update()` adds the
-  // whole of panDelta to the target *every frame* and only decays it by
-  // `inertia` afterwards — it never clears it — so one drag delta is applied
-  // d + 0.85d + 0.85^2 d + ... = d/(1 - inertia), i.e. 6.7x over. ogl's 0.1
-  // default is tuned against that coasting, not against the conversion.
-  //
-  // inertia: 0 applies each delta once and drops the throw, which is what makes
-  // a drag track the cursor exactly — the point under the pointer stays under
-  // it, Google-Maps style. Pan is never eased (the target is moved directly),
-  // so `ease` is left alone: it only smooths the zoom.
-  panSpeed: 1,
-  inertia: 0,
-  minDistance: DEFAULT_DIST / 40,
-  maxDistance: DEFAULT_DIST * 20,
-});
-// Orbit's default is left-rotate / right-pan, which with rotation off would
-// leave left-drag doing nothing at all. Left has to pan for a 2D view. Note the
-// switch in `onMouseDown` tests ORBIT first and bails when rotation is disabled,
-// so it isn't enough to point PAN at 0 — ORBIT has to move off it. The 3D step
-// restores the defaults.
-//
 // The cast is because ogl's .d.ts omits `mouseButtons`, which its constructor
 // does set (`Orbit.js`); the property is real, only the declaration is short.
 type MouseButtons = { ORBIT: number; ZOOM: number; PAN: number };
-(orbit as Orbit & { mouseButtons: MouseButtons }).mouseButtons = {
-  ORBIT: 2,
-  ZOOM: 1,
-  PAN: 0,
-};
+
+/**
+ * The controller for one dimensionality.
+ *
+ * Rebuilt rather than reconfigured when the mode changes, because ogl captures
+ * `enableRotate` as a constructor closure variable rather than assigning it to
+ * the instance — `orbit.enableRotate = true` looks right, type-checks against
+ * `OrbitOptions`, and does nothing. (ogl 1.0.11; the .d.ts is accurate, listing
+ * it under the options and not on the class.) `remove()` detaches every
+ * listener, so this does not stack handlers the way constructing one per run
+ * would, and the new controller seeds its spherical coordinates from the
+ * camera's current position and the target it is handed — so the view carries
+ * across a switch untouched.
+ *
+ * The mouse map differs with the mode. In 2D there is nothing to rotate, so
+ * left-drag has to pan or it would do nothing at all, and that needs both
+ * halves of the remap: the switch in `onMouseDown` tests ORBIT first and
+ * returns early when rotation is disabled, so pointing PAN at button 0 is not
+ * enough — ORBIT has to move off it too. In 3D left-drag orbits and right-drag
+ * pans, ogl's own default and what a 3D viewer is expected to do (Orbit
+ * suppresses the context menu itself, so the right button is free).
+ *
+ * One gesture is missing in 2D either way: one-finger touch drag, which Orbit
+ * routes to rotate. Two-finger pinch and pan both work.
+ */
+function makeOrbit(d: Components, target: Vec3): Orbit {
+  const orbit = new Orbit(camera, {
+    element: canvas,
+    target,
+    enableRotate: d === 3,
+    // These two go together, and neither is right alone.
+    //
+    // Orbit's pixel-to-world conversion is exactly 1:1 already
+    // (2*d*tan(fov/2)/clientHeight, and every point sits on the target plane), so
+    // panSpeed wants to be 1 rather than the 0.1 default. But `update()` adds the
+    // whole of panDelta to the target *every frame* and only decays it by
+    // `inertia` afterwards — it never clears it — so one drag delta is applied
+    // d + 0.85d + 0.85^2 d + ... = d/(1 - inertia), i.e. 6.7x over. ogl's 0.1
+    // default is tuned against that coasting, not against the conversion.
+    //
+    // inertia: 0 applies each delta once and drops the throw, which is what makes
+    // a drag track the cursor exactly — the point under the pointer stays under
+    // it, Google-Maps style. Pan is never eased (the target is moved directly),
+    // so `ease` is left alone: it only smooths the zoom.
+    panSpeed: 1,
+    inertia: 0,
+    minDistance: DEFAULT_DIST / 40,
+    maxDistance: DEFAULT_DIST * 20,
+  });
+  (orbit as Orbit & { mouseButtons: MouseButtons }).mouseButtons =
+    d === 3 ? { ORBIT: 0, ZOOM: 1, PAN: 2 } : { ORBIT: 2, ZOOM: 1, PAN: 0 };
+  return orbit;
+}
+
+// One controller at a time, at module scope rather than per run: `go()` already
+// leaks a window resize listener per run, harmless only because of the
+// `gen === runGen` guard, and a controller attaching its own handlers per run
+// would stack them for real.
+let cameraMode: Components = DIMS_MODE;
+let orbit = makeOrbit(cameraMode, new Vec3(0, 0, 0));
+
+/** Switch the controller's mode, carrying the current view across. */
+function setCameraMode(d: Components) {
+  if (d === cameraMode) return;
+  cameraMode = d;
+  const target = orbit.target.clone();
+  orbit.remove();
+  orbit = makeOrbit(d, target);
+}
 
 /** Back to the designated view: the framing that predates the camera. */
 function resetCamera() {
@@ -829,6 +880,7 @@ const params = {
   // shouldn't need a reload.
   knnMethod: KNN_MODE,
   algorithm: ALGO_MODE,
+  nComponents: DIMS_MODE,
   // Upstream's default. Only read under localmap.
   lowDistThres: 10,
 };
@@ -904,6 +956,22 @@ pacmapFolder
   })
   .on("change", (e) => syncAlgorithm(e.value as AlgoKey));
 
+// Same annotation discipline as ALGO_OPTIONS above, and for the same reason:
+// Tweakpane types option values as plain strings, so without it a typo here
+// would type-check and reach the library as an unusable width.
+const COMPONENT_OPTIONS: Record<string, Components> = { "2D": 2, "3D": 3 };
+
+// Setup-time like everything else in this folder: the buffers, the generated
+// shaders and the vertex layout are all sized from it before the first
+// iteration, so it is read at the top of `go()` and the folder is disabled for
+// the duration of the run.
+const componentsBinding = pacmapFolder
+  .addBinding(params, "nComponents", {
+    label: "components",
+    options: COMPONENT_OPTIONS,
+  })
+  .on("change", (e) => setCameraMode(e.value as Components));
+
 /**
  * Grey out what the selected engine does not read, and refresh the cost hint.
  *
@@ -915,6 +983,18 @@ pacmapFolder
 function syncAlgorithm(key: AlgoKey) {
   lowDistBinding.disabled = VARIANT_OF[key] === "pacmap";
   knnBinding.disabled = ENGINE_OF[key] === "cpu";
+  // The CPU engine is 2D-only for now — druid takes an `n_components` and this
+  // demo has yet to pass it one. Greying the control is the honest form of
+  // that; leaving it live would let a run be asked for 3D and quietly given a
+  // plane. Forced back rather than merely disabled, since the value would
+  // otherwise survive a switch made while 3D was selected.
+  const cpu = ENGINE_OF[key] === "cpu";
+  componentsBinding.disabled = cpu;
+  if (cpu && params.nComponents !== 2) {
+    params.nComponents = 2;
+    componentsBinding.refresh();
+    setCameraMode(2);
+  }
   updateSampleLabel();
 }
 

@@ -46,7 +46,15 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
 }
 `;
 
-export const renderWGSL = /* wgsl */ `
+/**
+ * The point renderer, templated on the embedding's width.
+ *
+ * `d` decides two things and nothing else: the vertex attribute's type, and
+ * whether the world position takes its z from the data or from the constant 0
+ * the 2D path has always passed. Everything downstream — the projection, the
+ * screen-space quad, the fragment — is already dimension-agnostic.
+ */
+export const renderWGSL = (d = 2) => /* wgsl */ `
 // 32 bytes. vec4 rather than vec3 because a vec3 in a uniform pads to 16 bytes
 // anyway, so the padded form is free — and it keeps one buffer size, one
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
@@ -78,7 +86,7 @@ const PALETTE = array<vec3<f32>, 10>(
 @vertex
 fn vs(
   @builtin(vertex_index) vi  : u32,
-  @location(0)           p   : vec2<f32>,
+  @location(0)           p   : vec${d}<f32>,
   @location(1)           lab : u32,
 ) -> VSOut {
   var corners = array<vec2<f32>, 6>(
@@ -87,15 +95,18 @@ fn vs(
   );
   let c = corners[vi];
 
-  // Data → world. Uniform scale on both axes so the embedding isn't stretched,
+  // Data → world. One scale for every axis so the embedding isn't stretched,
   // and centred on the origin, which is why the camera never has to re-fit: the
   // bounds reduce keeps doing the framing and the camera only moves when the
-  // user moves it. z is 0 while the embedding is 2D; the 3D step feeds it a
-  // third component and nothing else here changes.
+  // user moves it. In 2D the box's z extent is exactly 0, so one span
+  // expression serves both — measured, a 3D layout comes out near-isotropic
+  // (per-axis spreads within 3% of each other), so one span frames it well.
   let ctr  = (B.lo.xyz + B.hi.xyz) * 0.5;
   let ext  = B.hi.xyz - B.lo.xyz;
   let span = max(max(max(ext.x, ext.y), ext.z), 1e-6);
-  let w = vec3<f32>((p - ctr.xy) / (span * 0.55), 0.0);
+  let w = ${d === 3
+    ? "(p - ctr) / (span * 0.55)"
+    : "vec3<f32>((p - ctr.xy) / (span * 0.55), 0.0)"};
   // The projection owns the aspect divide now, so there is none here.
   var clip = V.viewProj * vec4<f32>(w, 1.0);
 

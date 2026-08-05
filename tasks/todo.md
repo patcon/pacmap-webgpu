@@ -66,21 +66,33 @@ unoptimized one of 3e-5.
 
 ## Phase 2 — The renderer
 
-- [ ] **3. Renderer + pane dropdown + camera mode** — L — deps: 2
-      `src/shaders.ts`, `src/main.ts`
-      - [ ] `renderWGSL(d)`: `@location(0) p : vec2/vec3<f32>`, world built per dim
-      - [ ] Quad expansion unchanged — radius stays screen-constant under zoom
-      - [ ] Pipeline `arrayStride: 4*d` / `float32x{d}`; `frameBytes = N * 4 * d`
-      - [ ] `N x 2` / 520KB history comment updated (frames are 50% larger in 3D)
-      - [ ] `components` dropdown in `dimensional reduction`, options annotated
-            `Record<string, 2 | 3>`; seeded from `?dims=`; read at the top of `go()`
-      - [ ] `setCameraMode(d)`: `enableRotate = d === 3`, `mouseButtons` swaps between the
-            2D remap and ogl's defaults; called from the dropdown and from `go()`
-      - [ ] The two "the 3D step does X" comments on the camera updated to describe what
-            it now does
-      - [ ] Browser: 3D at 2k — left-drag orbits, right-drag pans, wheel zooms,
-            double-click resets, scrubbing replays and still rotates
-      - [ ] Browser: back to 2D — left-drag pans again, old framing intact
+- [x] **3. Renderer + pane dropdown + camera mode** — L — deps: 2
+      `src/shaders.ts`, `src/main.ts`, `scripts/check-shaders.ts`
+      - [x] `renderWGSL(d)`: `@location(0) p : vec2/vec3<f32>`, world built per dim
+      - [x] Quad expansion unchanged — radius stays screen-constant under zoom
+      - [x] Pipeline `arrayStride: 4*d` / `float32x{d}`; `frameBytes = N * 4 * d`
+      - [x] `N x 2` / 520KB history comment updated (a 3D frame is 780KB at 65k, so a
+            3D run banks fewer frames or strides coarser at the same budget)
+      - [x] `components` dropdown in `dimensional reduction`, options annotated
+            `Record<string, Components>`; seeded from `?dims=3`; read at the top of `go()`
+      - [x] `check-shaders` builds the render pipeline at both dims (9 cases) — the
+            `float32x3` attribute and the 12-byte stride are validated, not assumed
+      - [x] **`setCameraMode(d)` rebuilds the controller rather than reconfiguring it.**
+            ogl captures `enableRotate` as a constructor closure variable, so
+            `orbit.enableRotate = true` type-checks against `OrbitOptions` and does
+            nothing. `remove()` detaches every listener and the new controller seeds its
+            sphericals from the camera's current position, so the view carries across
+      - [x] 3D restores ogl's `{ORBIT:0, ZOOM:1, PAN:2}`; 2D keeps the left-pan remap.
+            Orbit suppresses the context menu itself, so right-drag pan is free
+      - [x] The camera comments that described this as pending now describe what it does
+      - [x] **CPU engine stays 2D-only until Task 5:** `syncAlgorithm` greys the
+            dropdown and forces it back to 2, rather than letting a run be asked for 3D
+            and quietly handed a plane
+      - [ ] **Browser (yours):** 3D at 2k — left-drag orbits, right-drag pans, wheel
+            zooms, double-click resets, scrubbing replays and still rotates
+      - [ ] **Browser (yours):** back to 2D — left-drag pans again, old framing intact
+      - [ ] **Browser (yours):** expect an unsorted haze in 3D — no depth buffer until
+            Task 4. Structure should still be legible as you rotate
 
 ### ⬜ Checkpoint: 3D renders
 - [ ] End-to-end 3D on the GPU engine, both mouse mappings confirmed by hand

@@ -168,10 +168,10 @@ const cases: Case[] = [
       });
     },
   },
-  {
-    name: "render",
-    code: renderWGSL,
-    build: (device, module) => {
+  ...DIMS.map((d) => ({
+    name: `render-${d}d`,
+    code: renderWGSL(d),
+    build: (device: GPUDevice, module: GPUShaderModule) => {
       device.createRenderPipeline({
         layout: "auto",
         vertex: {
@@ -179,16 +179,22 @@ const cases: Case[] = [
           entryPoint: "vs",
           buffers: [
             {
-              arrayStride: 8,
+              // Must agree with the attribute's own type in the WGSL, and with
+              // the per-frame copies main.ts sizes from the same `d`.
+              arrayStride: 4 * d,
               stepMode: "instance",
               attributes: [
-                { shaderLocation: 0, offset: 0, format: "float32x2" },
+                {
+                  shaderLocation: 0,
+                  offset: 0,
+                  format: `float32x${d}` as GPUVertexFormat,
+                },
               ],
             },
             {
               arrayStride: 4,
               stepMode: "instance",
-              attributes: [{ shaderLocation: 1, offset: 0, format: "uint32" }],
+              attributes: [{ shaderLocation: 1, offset: 0, format: "uint32" as const }],
             },
           ],
         },
@@ -199,26 +205,26 @@ const cases: Case[] = [
           // does not affect WGSL validation, only the target's own validity.
           targets: [
             {
-              format: "bgra8unorm",
+              format: "bgra8unorm" as const,
               blend: {
                 color: {
-                  srcFactor: "src-alpha",
-                  dstFactor: "one-minus-src-alpha",
-                  operation: "add",
+                  srcFactor: "src-alpha" as const,
+                  dstFactor: "one-minus-src-alpha" as const,
+                  operation: "add" as const,
                 },
                 alpha: {
-                  srcFactor: "one",
-                  dstFactor: "one-minus-src-alpha",
-                  operation: "add",
+                  srcFactor: "one" as const,
+                  dstFactor: "one-minus-src-alpha" as const,
+                  operation: "add" as const,
                 },
               },
             },
           ],
         },
-        primitive: { topology: "triangle-list" },
+        primitive: { topology: "triangle-list" as const },
       });
     },
-  },
+  })),
 ];
 
 async function main(): Promise<number> {
