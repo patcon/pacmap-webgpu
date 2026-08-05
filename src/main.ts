@@ -803,21 +803,32 @@ function makeOrbit(d: Components, target: Vec3): Orbit {
     element: canvas,
     target,
     enableRotate: d === 3,
-    // These two go together, and neither is right alone.
+    // These three go together, and none of them is right alone.
     //
-    // Orbit's pixel-to-world conversion is exactly 1:1 already
-    // (2*d*tan(fov/2)/clientHeight, and every point sits on the target plane), so
-    // panSpeed wants to be 1 rather than the 0.1 default. But `update()` adds the
-    // whole of panDelta to the target *every frame* and only decays it by
-    // `inertia` afterwards — it never clears it — so one drag delta is applied
-    // d + 0.85d + 0.85^2 d + ... = d/(1 - inertia), i.e. 6.7x over. ogl's 0.1
-    // default is tuned against that coasting, not against the conversion.
+    // `update()` adds the whole of panDelta *and* sphericalDelta to the target
+    // every frame and only decays them by `inertia` afterwards — it never
+    // clears either — so one drag delta is applied d + 0.85d + 0.85^2 d + ...
+    // = d/(1 - inertia), i.e. 6.7x over at the default. Both of ogl's 0.1
+    // speeds are tuned against that coasting rather than against their own
+    // pixel conversions, so dropping inertia means restoring the 6.7x by hand
+    // on both of them, not just one.
     //
-    // inertia: 0 applies each delta once and drops the throw, which is what makes
-    // a drag track the cursor exactly — the point under the pointer stays under
-    // it, Google-Maps style. Pan is never eased (the target is moved directly),
-    // so `ease` is left alone: it only smooths the zoom.
+    // inertia: 0 applies each delta once and drops the throw, which is what
+    // makes a drag track the cursor exactly — the point under the pointer stays
+    // under it, Google-Maps style. Pan is never eased (the target is moved
+    // directly), so `ease` is left alone: it only smooths the zoom and rotate.
+    //
+    // panSpeed: Orbit's pixel-to-world conversion is exactly 1:1 already
+    // (2*d*tan(fov/2)/clientHeight, and every point sits on the target plane),
+    // so 1 is the value that tracks.
+    //
+    // rotateSpeed: 0.1/(1 - 0.85) = 2/3 reproduces ogl's own angular travel per
+    // pixel, which is what the reference viewer this borrows from feels like.
+    // At 0.1 a drag rotates 6.7x less than expected — the same factor, and the
+    // reason this was missed at first: with rotation off there was nothing to
+    // notice it on.
     panSpeed: 1,
+    rotateSpeed: 0.1 / 0.15,
     inertia: 0,
     minDistance: DEFAULT_DIST / 40,
     maxDistance: DEFAULT_DIST * 20,
