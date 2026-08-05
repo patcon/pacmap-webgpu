@@ -11,6 +11,7 @@ import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
 import { boundsWGSL, renderWGSL } from "./shaders";
 import { Pane } from "tweakpane";
+import { Camera, type OGLRenderingContext } from "ogl";
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -241,10 +242,12 @@ async function go() {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    // 80 bytes: viewProj mat4, res vec2, radius, pad. See `struct View`.
     const viewUniform = device.createBuffer({
-      size: 16,
+      size: 80,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    const viewUniformData = new Float32Array(20);
 
     // --- Playback history --------------------------------------------------
     // One slot per captured frame, plus slot 0 for the pre-optimization init.
@@ -345,11 +348,28 @@ async function go() {
       // The slider is in CSS px; 1.5 framebuffer px is the floor below which
       // points stop resolving at all.
       const radius = Math.max(1.5, view.pointSize * dpr);
-      device.queue.writeBuffer(
-        viewUniform,
-        0,
-        new Float32Array([canvas.width, canvas.height, radius, 0])
-      );
+
+      camera.perspective({ aspect: w / h });
+      // Refreshes viewMatrix and projectionViewMatrix. ogl does this inside
+      // `render()`, which this pipeline never calls, so it has to be explicit.
+      camera.updateMatrixWorld();
+
+      const m = viewUniformData;
+      m.set(camera.projectionViewMatrix, 0);
+      // ogl emits WebGL clip space, where z runs [-1, 1]; WebGPU's runs [0, 1]
+      // and clips anything below it. Remap with z' = (z + w)/2, which on a
+      // column-major matrix is a rewrite of row 2 against row 3. Nothing renders
+      // differently today — there is no depth attachment — but the 3D step turns
+      // depth testing on, and this is where that would silently eat half the
+      // points otherwise.
+      for (let i = 0; i < 4; i++) {
+        m[4 * i + 2] = 0.5 * (m[4 * i + 2] + m[4 * i + 3]);
+      }
+      m[16] = canvas.width;
+      m[17] = canvas.height;
+      m[18] = radius;
+      m[19] = 0;
+      device.queue.writeBuffer(viewUniform, 0, m);
     }
     // Point-size edits land immediately, even mid-run when nothing else is
     // rewriting the view uniform.
@@ -629,6 +649,37 @@ const view = { pointSize: 1.8, autoZoom: true };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
 let onViewChange: (() => void) | null = null;
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+// A real camera rather than a 2D pan/zoom transform, because 3D rendering is the
+// next step: this stays as-is and gains rotation, where an affine {scale, offset}
+// would have to be thrown away. Only ogl's camera and controller are used — its
+// `Renderer` is never constructed and no WebGL context exists; the WGSL pipeline
+// below does the drawing, and all this supplies is a view-projection matrix.
+//
+// `gl` is the first constructor argument and is genuinely unused by `Camera`
+// (checked against ogl 1.0.11's source, which never assigns or reads it), which
+// is what lets it be driven headless like this.
+const FOV = 45;
+const camera = new Camera(null as unknown as OGLRenderingContext, {
+  fov: FOV,
+  near: 0.01,
+  far: 1000,
+});
+
+/**
+ * The distance at which the projection reproduces the framing that predates the
+ * camera, exactly. World space is `(p - ctr) / (span * 0.55)`, so the embedding's
+ * half-extent is `1 / (2 * 0.55) = 0.909`; the old shader mapped that straight to
+ * 0.909 of NDC height. A perspective camera sees a half-height of `d*tan(fov/2)`,
+ * so wanting 0.909 world → 0.909 NDC means the visible half-height must be 1, i.e.
+ * `d = 1/tan(fov/2)`. Same margin, same aspect handling, same pixels.
+ */
+const DEFAULT_DIST = 1 / Math.tan((FOV * Math.PI) / 360);
+camera.position.set(0, 0, DEFAULT_DIST);
 
 /**
  * PaCMAP pair ratios. n_MN and n_FP are counts per point, derived as

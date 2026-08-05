@@ -44,7 +44,9 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
 
 export const renderWGSL = /* wgsl */ `
 struct Bounds { lo : vec2<f32>, hi : vec2<f32> };
-struct View   { res : vec2<f32>, radius : f32, _pad : f32 };
+// 80 bytes: mat4 64 + vec2 8 + f32 4 + pad 4. viewProj already carries the
+// WebGL-to-WebGPU depth remap (see resize() in main.ts), so it is used as-is.
+struct View   { viewProj : mat4x4<f32>, res : vec2<f32>, radius : f32, _pad : f32 };
 
 @group(0) @binding(0) var<uniform> B : Bounds;
 @group(0) @binding(1) var<uniform> V : View;
@@ -77,17 +79,25 @@ fn vs(
   );
   let c = corners[vi];
 
-  // Uniform scale on both axes so the embedding isn't stretched.
+  // Data → world. Uniform scale on both axes so the embedding isn't stretched,
+  // and centred on the origin, which is why the camera never has to re-fit: the
+  // bounds reduce keeps doing the framing and the camera only moves when the
+  // user moves it. z is 0 while the embedding is 2D; the 3D step feeds it a
+  // third component and nothing else here changes.
   let ctr  = (B.lo + B.hi) * 0.5;
   let span = max(max(B.hi.x - B.lo.x, B.hi.y - B.lo.y), 1e-6);
-  var q = (p - ctr) / (span * 0.55);
-  let aspect = V.res.x / V.res.y;
-  q.x = q.x / aspect;
+  let w = vec3<f32>((p - ctr) / (span * 0.55), 0.0);
+  // The projection owns the aspect divide now, so there is none here.
+  var clip = V.viewProj * vec4<f32>(w, 1.0);
 
   let r = vec2<f32>(2.0 * V.radius / V.res.x, 2.0 * V.radius / V.res.y);
+  // Times clip.w so the perspective divide cancels: a point keeps a constant
+  // pixel size at any camera distance, so zooming resolves a cluster rather
+  // than magnifying it.
+  clip = vec4<f32>(clip.xy + c * r * clip.w, clip.zw);
 
   var out : VSOut;
-  out.clip = vec4<f32>(q + c * r, 0.0, 1.0);
+  out.clip = clip;
   out.col  = PALETTE[min(lab, 9u)];
   out.uv   = c;
   return out;
