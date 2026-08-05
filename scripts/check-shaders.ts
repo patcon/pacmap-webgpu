@@ -67,6 +67,11 @@ const computeLayout = (
   return device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
 };
 
+// The embedding dimensionalities the library generates code for. Both are
+// built here because the sources are templated on it: a `vec3` form that never
+// compiled would look exactly like a working one until the dropdown was moved.
+const DIMS = [2, 3] as const;
+
 const cases: Case[] = [
   {
     name: "knn",
@@ -103,10 +108,10 @@ const cases: Case[] = [
       }
     },
   },
-  {
-    name: "fp-rebuild",
-    code: shaderSources.fpShaderSource(N, NFP, K, 10, 7),
-    build: (device, module) => {
+  ...DIMS.map((d) => ({
+    name: `fp-rebuild-${d}d`,
+    code: shaderSources.fpShaderSource(N, NFP, K, 10, 7, d),
+    build: (device: GPUDevice, module: GPUShaderModule) => {
       // One layout across all six entry points, for the same reason NN-Descent
       // declares its own: `layout: "auto"` derives a narrower one per entry
       // point (fp_clear never touches Y or the near-partner list), and a single
@@ -130,11 +135,11 @@ const cases: Case[] = [
         device.createComputePipeline({ layout, compute: { module, entryPoint } });
       }
     },
-  },
-  {
-    name: "pacmap",
-    code: shaderSources.shaderSource(N, NFP),
-    build: (device, module) => {
+  })),
+  ...DIMS.map((d) => ({
+    name: `pacmap-${d}d`,
+    code: shaderSources.shaderSource(N, NFP, d),
+    build: (device: GPUDevice, module: GPUShaderModule) => {
       // Eight storage buffers is the default per-stage limit, so this layout is
       // also the check that the shader still fits inside it.
       const layout = computeLayout(device, [
@@ -152,7 +157,7 @@ const cases: Case[] = [
         device.createComputePipeline({ layout, compute: { module, entryPoint } });
       }
     },
-  },
+  })),
   {
     name: "bounds",
     code: boundsWGSL(N),

@@ -27,27 +27,42 @@ throughout — the 2D path is meant to come out bit-identical.
       - [x] `check:ab` vs. `HEAD` prints 0 — bit-identical, the library is untouched
       - [ ] **Browser (yours):** a run looks identical, `auto zoom` on and off
 
-- [ ] **2. `nComponents` in the library** — L — deps: 1
+- [x] **2. `nComponents` in the library** — L — deps: 1
       `src/pacmap-webgpu.ts`, `scripts/check-shaders.ts`, `scripts/check-kernels.ts`
-      - [ ] `PacmapOptions.nComponents?: 2 | 3`, default 2 (note: `D` is the *input* dim)
-      - [ ] `alias V` + `const DIM` + `ld(i)` in `shaderSource` and `fpShaderSource`;
-            every `vec2<f32>(Y[...])` becomes `ld(...)`, zero-init becomes `V()`
-      - [ ] Gradient stores emitted per component; `adam_main` loop bound `DIM`
-      - [ ] `Y0`, `gradBuf`, `mBuf`, `vBuf`, `read()` staging sized `N*d`
-      - [ ] `EmbeddingRun.positions` doc says `N x d`
-      - [ ] `check-shaders.ts` case table iterates `d ∈ {2, 3}`
-      - [ ] `check-kernels.ts` runs resample/reverse at `d = 3`; on-a-line fixture keeps
-            y = z = 0 so its "within thres = within ten indices" invariant survives
-      - [ ] New genuinely-3D kernel case: candidate inside thres in x/y, outside via z
-      - [ ] Host distance oracle uses all `d` components
-      - [ ] Each new assertion demonstrated failing first (e.g. drop z from `ld`)
-      - [ ] `check:ab -- <pre-task-ref>` prints 0 for `--variant=pacmap` *and*
-            `--variant=localmap`
+      - [x] `PacmapOptions.nComponents?: 2 | 3`, default 2 (note: `D` is the *input* dim)
+      - [x] `alias Pt` + `const DIM` + `ld(i)` in `shaderSource` and `fpShaderSource`;
+            every `vec2<f32>(Y[...])` becomes `ld(...)`, zero-init becomes `Pt()`.
+            **Not `V`** — the gradient shader already binds Adam's second moment under
+            that name and WGSL reads the collision as a redeclaration
+      - [x] Gradient stores emitted per component; `adam_main` loop bound `DIM`
+      - [x] `Y0`, `gradBuf`, `mBuf`, `vBuf`, `read()` staging sized `N*d`
+      - [x] `EmbeddingRun.positions` doc says `N x d`
+      - [x] `check-shaders.ts` case table iterates `d ∈ {2, 3}` (8 cases)
+      - [x] `check-kernels.ts` runs the resample at `d = 2` *and* `d = 3`; the line
+            fixture now runs **diagonally** (0.1/√d per component per step) rather than
+            along x with y = z = 0 — same "within thres = within ten indices" invariant,
+            but every component is load-bearing, so a plane-only distance fails it
+      - [x] New `e2e-3d/*` cases per variant: length, finite, reproducible, and
+            `third-axis-is-optimized` (z spread within 5x of x/y — an unoptimized z is
+            still finite and non-constant, just stuck at the init's 1e-4 scale)
+      - [x] Host distance oracle uses all `d` components
+      - [x] Both mutations demonstrated failing first — Adam looping to `2u` and `ld`
+            zeroing z each trip `third-axis-is-optimized`; the latter also trips
+            `fp-resample-3d/respects-low-dist-thres`
+      - [x] `check:ab -- HEAD` prints 0 for `--variant=pacmap` *and* `--variant=localmap`
+            — bit-identical, both
 
-### ⬜ Checkpoint: Foundation
-- [ ] `build`, `check:shaders`, `check:kernels`, `check:druid` all green
-- [ ] `check:ab` proves the 2D path unmoved on both variants
-- [ ] Library computes in 3D; nothing draws it yet
+### ✅ Checkpoint: Foundation
+- [x] `build`, `check:shaders` (8), `check:kernels` (41), `check:druid` (17) all green
+- [x] `check:ab` proves the 2D path unmoved on both variants — bit-identical
+- [x] Library computes in 3D; nothing draws it yet
+
+Measured while landing this, and worth carrying into Task 3: the 3D layouts come out
+near-isotropic — per-axis spreads 29.8 / 29.9 / 29.1 (pacmap) and 23.2 / 25.2 / 23.3
+(localmap) at N=400 — so the single `span` the renderer maxes over frames a 3D run
+sensibly and no per-axis scaling is needed. It also sets the threshold's headroom: the
+check demands z > 0.2x the widest axis, against a real ratio of ~0.97 and an
+unoptimized one of 3e-5.
 
 ## Phase 2 — The renderer
 

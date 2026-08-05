@@ -261,11 +261,21 @@ const ISOLATED = RES_N - 1;
  * Points on a line at spacing 0.1, so |y_i - y_j| = 0.1*|i-j| and "within
  * low_dist_thres" is exactly "within ten indices". The constraint is then
  * checkable rather than merely plausible.
+ *
+ * The line runs diagonally — every component carries 0.1/sqrt(d) per step —
+ * rather than along one axis, which is what makes each component load-bearing.
+ * A kernel that dropped the third would measure sqrt(2/3) of the true distance,
+ * so points eleven and twelve apart would pass a threshold set at ten and
+ * `respects-low-dist-thres` would fail. Laid along x with y = z = 0 the same
+ * bug would be invisible.
  */
-function resampleFixture() {
-  const Y = new Float32Array(RES_N * 2);
-  for (let i = 0; i < RES_N; i++) Y[2 * i] = 0.1 * i;
-  Y[2 * ISOLATED] = 1e6;
+function resampleFixture(d: number) {
+  const Y = new Float32Array(RES_N * d);
+  const step = 0.1 / Math.sqrt(d);
+  for (let i = 0; i < RES_N; i++) {
+    for (let c = 0; c < d; c++) Y[d * i + c] = step * i;
+  }
+  Y[d * ISOLATED] = 1e6;
 
   const nbFwd = new Uint32Array(RES_N * RES_NNB);
   for (let i = 0; i < RES_N; i++) {
@@ -285,16 +295,18 @@ function resampleFixture() {
 
 async function resample(
   device: GPUDevice,
-  round: number
+  round: number,
+  d: number
 ): Promise<Uint32Array> {
-  const { Y, nbFwd, fp0 } = resampleFixture();
+  const { Y, nbFwd, fp0 } = resampleFixture(d);
   const module = device.createShaderModule({
     code: shaderSources.fpShaderSource(
       RES_N,
       RES_NFP,
       RES_NNB,
       RES_THRES,
-      RES_SEED
+      RES_SEED,
+      d
     ),
   });
   const bgl = fpLayout(device);
@@ -348,11 +360,13 @@ async function resample(
   return readback(device, fpBuf, fp0.byteLength);
 }
 
-async function checkResample(device: GPUDevice): Promise<void> {
-  const { Y, nbFwd, fp0 } = resampleFixture();
-  const got = await resample(device, 3);
+async function checkResample(device: GPUDevice, d: number): Promise<void> {
+  const { Y, nbFwd, fp0 } = resampleFixture(d);
+  const got = await resample(device, 3, d);
   const dist = (a: number, b: number) =>
-    Math.hypot(Y[2 * a] - Y[2 * b], Y[2 * a + 1] - Y[2 * b + 1]);
+    Math.hypot(
+      ...Array.from({ length: d }, (_, c) => Y[d * a + c] - Y[d * b + c])
+    );
 
   let redrawn = 0;
   const bad = { self: 0, dup: 0, nbr: 0, far: 0 };
@@ -374,18 +388,16 @@ async function checkResample(device: GPUDevice): Promise<void> {
     }
   }
 
-  check("fp-resample/rejects-self", bad.self === 0, `${bad.self} violations`);
-  check("fp-resample/rejects-duplicates", bad.dup === 0, `${bad.dup} violations`);
-  check("fp-resample/rejects-near-partners", bad.nbr === 0, `${bad.nbr} violations`);
-  check(
-    "fp-resample/respects-low-dist-thres",
-    bad.far === 0,
-    `${bad.far} violations`
-  );
+  const tag = (name: string) => `fp-resample-${d}d/${name}`;
+
+  check(tag("rejects-self"), bad.self === 0, `${bad.self} violations`);
+  check(tag("rejects-duplicates"), bad.dup === 0, `${bad.dup} violations`);
+  check(tag("rejects-near-partners"), bad.nbr === 0, `${bad.nbr} violations`);
+  check(tag("respects-low-dist-thres"), bad.far === 0, `${bad.far} violations`);
   // Guards the checks above from passing vacuously on a kernel that wrote
   // nothing at all.
   check(
-    "fp-resample/actually-redraws",
+    tag("actually-redraws"),
     redrawn > RES_N * RES_NFP * 0.5,
     `only ${redrawn} of ${RES_N * RES_NFP} slots redrawn`
   );
@@ -395,16 +407,16 @@ async function checkResample(device: GPUDevice): Promise<void> {
   const isolatedKept = Array.from({ length: RES_NFP }, (_, s) => s).every(
     (s) => got[ISOLATED * RES_NFP + s] === fp0[ISOLATED * RES_NFP + s]
   );
-  check("fp-resample/exhausted-slot-keeps-partner", isolatedKept);
+  check(tag("exhausted-slot-keeps-partner"), isolatedKept);
 
-  const same = await resample(device, 3);
+  const same = await resample(device, 3, d);
   check(
-    "fp-resample/same-round-reproduces",
+    tag("same-round-reproduces"),
     same.every((v, k) => v === got[k])
   );
-  const other = await resample(device, 4);
+  const other = await resample(device, 4, d);
   check(
-    "fp-resample/different-round-differs",
+    tag("different-round-differs"),
     other.some((v, k) => v !== got[k])
   );
 }
@@ -543,12 +555,14 @@ function blobs(): Float32Array {
 
 async function embed(
   device: GPUDevice,
-  variant: "pacmap" | "localmap"
+  variant: "pacmap" | "localmap",
+  nComponents: 2 | 3 = 2
 ): Promise<Float32Array> {
   const pm = await pacmapWebGPU(device, blobs(), E2E_N, E2E_D, {
     seed: 7,
     knn: "cpu",
     variant,
+    nComponents,
   });
   pm.run();
   const Y = await pm.read();
@@ -588,6 +602,47 @@ async function checkEndToEnd(device: GPUDevice): Promise<void> {
     lm.every(Number.isFinite) && spread(lm) > 1e-3,
     `spread ${spread(lm)}`
   );
+
+  // --- Three components --------------------------------------------------
+  // The axis a 2D-shaped kernel would leave untouched is the one worth
+  // measuring, so every check here looks at the third component specifically:
+  // a shader that computed x and y and ignored z would still return a
+  // plausible N*3 array, finite and well spread, made of a good 2D layout
+  // sitting in a plane.
+  const axisSpread = (a: Float32Array, c: number) => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < E2E_N; i++) {
+      const v = a[3 * i + c];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    return hi - lo;
+  };
+
+  for (const variant of ["pacmap", "localmap"] as const) {
+    const y3 = await embed(device, variant, 3);
+    const tag = (name: string) => `e2e-3d/${variant}-${name}`;
+
+    check(
+      tag("length"),
+      y3.length === E2E_N * 3,
+      `got ${y3.length}, want ${E2E_N * 3}`
+    );
+    check(tag("finite"), y3.every(Number.isFinite));
+
+    // Comparable extent on all three axes. The init is isotropic, so a z that
+    // never moved would still be finite and non-constant — it would just sit at
+    // the init's 1e-4 scale, orders of magnitude under the other two.
+    const [sx, sy, sz] = [0, 1, 2].map((c) => axisSpread(y3, c));
+    check(
+      tag("third-axis-is-optimized"),
+      sz > 0.2 * Math.max(sx, sy),
+      `spreads ${sx.toFixed(3)} / ${sy.toFixed(3)} / ${sz.toFixed(3)}`
+    );
+
+    check(tag("reproducible"), identical(y3, await embed(device, variant, 3)));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +658,10 @@ async function main(): Promise<number> {
 
   try {
     await checkReverseCsr(session.device);
-    await checkResample(session.device);
+    // Both dimensionalities: the resample is the one kernel that measures a
+    // distance in the embedding, so it is where a dropped component shows up.
+    await checkResample(session.device, 2);
+    await checkResample(session.device, 3);
     await checkBounds(session.device);
     await checkEndToEnd(session.device);
   } finally {

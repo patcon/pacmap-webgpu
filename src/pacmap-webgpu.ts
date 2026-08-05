@@ -39,6 +39,16 @@ export interface PacmapOptions {
    * radius the redrawn further pairs are restricted to.
    */
   lowDistThres?: number;
+  /**
+   * Embedding dimensionality — `n_components` upstream. Default 2.
+   *
+   * Note this is the *output* width; the `D` argument to `pacmapWebGPU` is the
+   * input's. Everything before the optimizer is untouched by it: the kNN graph,
+   * the sigma scaling and the pair sampling all work in input space, so only
+   * the position/gradient/Adam buffers and the two generated shaders change
+   * shape. 3 costs 50% more memory per frame for a consumer banking a trace.
+   */
+  nComponents?: 2 | 3;
   /** Nearest neighbors per point. Default follows the reference heuristic. */
   nNeighbors?: number;
   /** n_MN = round(nNeighbors * mnRatio). Default 0.5 */
@@ -1211,12 +1221,51 @@ const FP_WG = 64;
  *   Without it a fixed seed would stop determining the layout, which is a
  *   property only `nndescentGPU` is allowed to give up.
  */
+/** Component letters, for generating swizzles and per-component stores. */
+const COMPS = ["x", "y", "z"] as const;
+
+/**
+ * The one thing both generated shaders need to be dimension-agnostic: a vector
+ * type and a loader that reads one point out of the packed `Y`.
+ *
+ * A `vec${d}` alias rather than a component loop, because every use downstream
+ * is `dot(d, d)` or a scale-and-add — vector expressions the compiler already
+ * handles, which a loop would turn into scalar code for no gain in clarity.
+ * `Pt()` is WGSL's zero value, so even the accumulator's initializer needs no
+ * per-dimension spelling. It is `Pt` rather than the obvious `V` because the
+ * gradient shader already binds a storage buffer under that name (Adam's second
+ * moment), and WGSL takes the collision as a redeclaration.
+ *
+ * At d = 2 this emits exactly the indexing the shaders were written with by
+ * hand (`Y[2u*i]`, `Y[2u*i + 1u]`), which is what lets the 2D path stay
+ * bit-identical through this change.
+ */
+function vecPrelude(d: number): string {
+  const load = COMPS.slice(0, d)
+    .map((_, c) => `Y[DIM * i + ${c}u]`)
+    .join(", ");
+  return /* wgsl */ `
+alias Pt = vec${d}<f32>;
+const DIM : u32 = ${d}u;
+
+fn ld(i : u32) -> Pt { return Pt(${load}); }
+`;
+}
+
+/** `Grad[DIM*i + c] = g.c;` for each component. */
+function storeComps(target: string, value: string, d: number): string {
+  return COMPS.slice(0, d)
+    .map((c, k) => `  ${target}[DIM * i + ${k}u] = ${value}.${c};`)
+    .join("\n");
+}
+
 function fpShaderSource(
   N: number,
   nFP: number,
   nNB: number,
   lowDistThres: number,
-  seed: number
+  seed: number,
+  d = 2
 ): string {
   return /* wgsl */ `
 struct Params {
@@ -1232,6 +1281,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read>       NbF : array<u32>;
 @group(0) @binding(5) var<uniform>             P   : Params;
 
+${vecPrelude(d)}
 const N   : u32 = ${N}u;
 const NFP : u32 = ${nFP}u;
 const NNB : u32 = ${nNB}u;
@@ -1274,7 +1324,7 @@ fn fp_resample(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= N) { return; }
 
-  let yi = vec2<f32>(Y[2u * i], Y[2u * i + 1u]);
+  let yi = ld(i);
   let round = u32(P.it.x);
   let base = i * NFP;
 
@@ -1301,7 +1351,7 @@ fn fp_resample(@builtin(global_invocation_id) gid : vec3<u32>) {
       }
       if (reject) { continue; }
 
-      let d = yi - vec2<f32>(Y[2u * c], Y[2u * c + 1u]);
+      let d = yi - ld(c);
       if (dot(d, d) > THRES2) { continue; }
 
       picks[s] = c;
@@ -1387,7 +1437,7 @@ fn fp_sort(@builtin(global_invocation_id) gid : vec3<u32>) {
 `;
 }
 
-function shaderSource(N: number, nFP: number): string {
+function shaderSource(N: number, nFP: number, d = 2): string {
   return /* wgsl */ `
 struct Params {
   w  : vec4<f32>,   // wNB, wMN, wFP, lr
@@ -1405,6 +1455,7 @@ struct Params {
 @group(0) @binding(7) var<storage, read>       FpF  : array<u32>;
 @group(0) @binding(8) var<storage, read>       FpR  : array<u32>;
 
+${vecPrelude(d)}
 const N   : u32 = ${N}u;
 const NFP : u32 = ${nFP}u;
 // FpR is one buffer holding two regions: [0, N+1) offsets, then the indices.
@@ -1414,8 +1465,8 @@ const FPR_BASE : u32 = ${N + 1}u;
 // sign works out for both from the one expression, exactly as it does for the
 // CSR's duplicated entries: the displacement flips between the two directions
 // while the scalar, a function of |d|^2 only, does not.
-fn fpForce(yi : vec2<f32>, j : u32) -> vec2<f32> {
-  let d = yi - vec2<f32>(Y[2u * j], Y[2u * j + 1u]);
+fn fpForce(yi : Pt, j : u32) -> Pt {
+  let d = yi - ld(j);
   let dd = 1.0 + dot(d, d);
   let r = 1.0 + dd;
   return (-P.w.z * 2.0 / (r * r)) * d;
@@ -1430,8 +1481,8 @@ fn grad_main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= N) { return; }
 
-  let yi = vec2<f32>(Y[2u * i], Y[2u * i + 1u]);
-  var g = vec2<f32>(0.0, 0.0);
+  let yi = ld(i);
+  var g = Pt();
 
   let lo = Off[i];
   let hi = Off[i + 1u];
@@ -1441,7 +1492,7 @@ fn grad_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let kind = packed >> 30u;
     let j = packed & 0x3FFFFFFFu;
 
-    let d = yi - vec2<f32>(Y[2u * j], Y[2u * j + 1u]);
+    let d = yi - ld(j);
     let dd = 1.0 + dot(d, d);
 
     var c : f32 = 0.0;
@@ -1477,8 +1528,7 @@ fn grad_main(@builtin(global_invocation_id) gid : vec3<u32>) {
     g = g + fpForce(yi, FpR[FPR_BASE + p]);
   }
 
-  Grad[2u * i]      = g.x;
-  Grad[2u * i + 1u] = g.y;
+${storeComps("Grad", "g", d)}
 }
 
 @compute @workgroup_size(64)
@@ -1486,8 +1536,8 @@ fn adam_main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= N) { return; }
 
-  for (var c : u32 = 0u; c < 2u; c = c + 1u) {
-    let k = 2u * i + c;
+  for (var c : u32 = 0u; c < DIM; c = c + 1u) {
+    let k = DIM * i + c;
     let g = Grad[k];
 
     let m = ${ADAM_B1} * M[k] + ${1 - ADAM_B1} * g;
@@ -1517,7 +1567,12 @@ fn adam_main(@builtin(global_invocation_id) gid : vec3<u32>) {
  * narrows that back to synchronous for the GPU path, which never awaits.
  */
 export interface EmbeddingRun {
-  /** N x 2 f32 positions. Bindable as a vertex buffer for zero-copy rendering. */
+  /**
+   * N x d f32 positions, packed. Bindable as a vertex buffer for zero-copy
+   * rendering; `d` is whatever `nComponents` the run was created with, so a
+   * consumer's vertex layout and per-frame copies are sized from that rather
+   * than from this buffer.
+   */
   positions: GPUBuffer;
   run(): void | Promise<void>;
   runRange(from: number, to: number): void | Promise<void>;
@@ -1548,6 +1603,7 @@ export async function pacmapWebGPU(
   const [n1, n2, n3] = opts.phases ?? [100, 100, 250];
   const lr = opts.lr ?? 1.0;
   const variant = opts.variant ?? "pacmap";
+  const d = opts.nComponents ?? 2;
   const lowDistThres = opts.lowDistThres ?? 10;
   const totalIters = n1 + n2 + n3;
   const rand = mulberry32(opts.seed ?? 42);
@@ -1575,8 +1631,8 @@ export async function pacmapWebGPU(
 
   // [Reference default init is scaled PCA. Gaussian is used here for brevity;
   //  it converges but embeddings will differ run-to-run across seeds.]
-  const Y0 = new Float32Array(N * 2);
-  for (let i = 0; i < N * 2; i++) {
+  const Y0 = new Float32Array(N * d);
+  for (let i = 0; i < N * d; i++) {
     const u = Math.max(rand(), 1e-12);
     const v = rand();
     Y0[i] = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v) * 0.0001;
@@ -1590,9 +1646,9 @@ export async function pacmapWebGPU(
   const yBuf = mk(Y0, S | GPUBufferUsage.COPY_SRC | GPUBufferUsage.VERTEX);
   const offBuf = mk(offsets, S);
   const adjBuf = mk(data, S);
-  const gradBuf = device.createBuffer({ size: N * 2 * 4, usage: S });
-  const mBuf = mk(new Float32Array(N * 2), S);
-  const vBuf = mk(new Float32Array(N * 2), S);
+  const gradBuf = device.createBuffer({ size: N * d * 4, usage: S });
+  const mBuf = mk(new Float32Array(N * d), S);
+  const vBuf = mk(new Float32Array(N * d), S);
   // These two put the gradient shader at 8 storage buffers, which is the
   // default maxStorageBuffersPerShaderStage — no headroom left. If a ninth is
   // ever needed, M and V are the ones to interleave: same length, same access
@@ -1629,7 +1685,7 @@ export async function pacmapWebGPU(
   const paramBuf = mk(params, GPUBufferUsage.UNIFORM);
 
   // --- Pipelines ---------------------------------------------------------
-  const module = device.createShaderModule({ code: shaderSource(N, nFP) });
+  const module = device.createShaderModule({ code: shaderSource(N, nFP, d) });
 
   const storageEntry = (
     binding: number,
@@ -1701,7 +1757,7 @@ export async function pacmapWebGPU(
     const cntBuf = device.createBuffer({ size: N * 4, usage: S });
     const nbBuf = mk(pairs.nbFwd, S);
     const fpModule = device.createShaderModule({
-      code: fpShaderSource(N, nFP, nNB, lowDistThres, opts.seed ?? 42),
+      code: fpShaderSource(N, nFP, nNB, lowDistThres, opts.seed ?? 42, d),
     });
     const fpLayout = device.createBindGroupLayout({
       entries: [
@@ -1797,11 +1853,11 @@ export async function pacmapWebGPU(
 
   async function read(): Promise<Float32Array> {
     const staging = device.createBuffer({
-      size: N * 2 * 4,
+      size: N * d * 4,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
     const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(yBuf, 0, staging, 0, N * 2 * 4);
+    enc.copyBufferToBuffer(yBuf, 0, staging, 0, N * d * 4);
     device.queue.submit([enc.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(staging.getMappedRange().slice(0));
