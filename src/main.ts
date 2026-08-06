@@ -1191,6 +1191,8 @@ function frame(): Promise<void> {
 // `occlusion` is read only in 3D (see `occludingNow` in `go()`), where it
 // decides between an opaque, depth-tested cloud and the blended haze that is
 // the only sensible thing to draw when every point is coplanar.
+const EDGE_TITLE = "pair graph";
+
 const view = {
   pointSize: 1.8,
   autoZoom: false,
@@ -1477,6 +1479,18 @@ function syncComponents(d: Components) {
 function syncAlgorithm(key: AlgoKey) {
   lowDistBinding.disabled = VARIANT_OF[key] === "pacmap";
   knnBinding.disabled = ENGINE_OF[key] === "cpu";
+  // Druid builds its own neighbour graph internally and exposes nothing, so
+  // `EmbeddingRun.graph` is undefined there and `go()` builds no overlay at all.
+  // Greyed rather than hidden, like `occlusion`, so the folder keeps its size.
+  edgeFolder.disabled = ENGINE_OF[key] === "cpu";
+  // LocalMAP redraws the further pairs against the embedding 24 times during
+  // phase 3, on the GPU, and those redraws never come back to the host — so the
+  // red edges are the set drawn at setup for the whole run. Said here because
+  // it is visible: they sit still while the points move.
+  edgeFolder.title =
+    VARIANT_OF[key] === "localmap"
+      ? `${EDGE_TITLE} — further pairs are the initial draw`
+      : EDGE_TITLE;
   updateSampleLabel();
 }
 
@@ -1608,17 +1622,47 @@ viewFolder
     step: 1,
   })
   .on("change", () => onViewChange?.());
-// The pair-graph overlay. One checkbox for now; the per-kind percentages are
-// still constants in `view.edgePct`, and get their own folder with sliders next.
-// Live like everything else here — it changes which draws are encoded, and the
-// index buffer holding every pair is what lets that cost nothing.
-viewFolder
-  .addBinding(view, "edges", { label: "show edges" })
-  .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.
 viewFolder
   .addButton({ title: "reset camera" })
   .on("click", () => resetCamera());
+
+// ---------------------------------------------------------------------------
+// The pair graph
+//
+// Its own folder rather than more rows under `rendering`, because it is about
+// the algorithm's structure where the rest of that folder is about how the
+// cloud is drawn. Live like `rendering` though, and for a stronger reason: the
+// index buffer holds every pair, so a percentage moves a draw count and nothing
+// else — no buffer rewritten, no run restarted.
+//
+// The labels carry what a colour cannot. Green pulls, red pushes, and yellow
+// pulls only for the first 200 of 450 iterations — `weightsAt` sends w_MN to 0
+// for the whole of phase 3, so a drawn mid-near edge is not necessarily a
+// pulling one. That is the single place where "an edge means this pair exists"
+// reads as a stronger claim than it is, and it is cheaper to say so than to
+// encode weight into opacity.
+// ---------------------------------------------------------------------------
+
+const edgeFolder = pane.addFolder({ title: EDGE_TITLE });
+edgeFolder
+  .addBinding(view, "edges", { label: "show edges" })
+  .on("change", () => onViewChange?.());
+const EDGE_LABELS: Record<EdgeKind, string> = {
+  near: "near % (attract)",
+  midNear: "mid-near % (w=0 in phase 3)",
+  further: "further % (repel)",
+};
+for (const kind of EDGE_KINDS) {
+  edgeFolder
+    .addBinding(view.edgePct, kind, {
+      label: EDGE_LABELS[kind],
+      min: 0,
+      max: 100,
+      step: 0.5,
+    })
+    .on("change", () => onViewChange?.());
+}
 
 // Bindings all exist now, so the pane can be brought in line with whatever
 // `?algo=` and `?dims=` selected. Also draws the first cost hint.
