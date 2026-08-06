@@ -69,13 +69,21 @@ struct View {
   res        : vec2<f32>,
   radius     : f32,
   occlude    : f32,
-  digits     : f32,
+  // How many points draw as digits: the slider's percentage resolved against N
+  // on the CPU, compared against each point's rank. A count and not a fraction
+  // so the shader needs no N.
+  digitCount : f32,
   digitScale : f32,
 };
 
 @group(0) @binding(0) var<uniform> B : Bounds;
 @group(0) @binding(1) var<uniform> V : View;
-// The digit-thumbnail atlas: tile-major, TILE_PX x TILE_PX intensities per tile.
+// The digit atlas: every point's 28x28 bitmap, tile-major, four 8-bit
+// intensities to the u32. Quantized because holding *all* of them is what makes
+// the digit percentage a render-time slider rather than a setup parameter — at
+// f32 the buffer would be ~204MB at N=65k against a 128MB default limit on a
+// storage binding, and at 8 bits it is ~51MB. The tile index is the point
+// index, so there is no mapping to keep.
 //
 // A storage buffer and not an r8unorm texture with a filtering sampler, which
 // is the natural tool for this. @kmamal/gpu's createView() unconditionally
@@ -85,12 +93,12 @@ struct View {
 // bundle. A texture here would have meant deleting the one case that encodes a
 // draw, at the exact moment of adding a binding that could break it. Filtering
 // by hand below is the cheaper half of that trade.
-@group(0) @binding(2) var<storage, read> atlas : array<f32>;
+@group(0) @binding(2) var<storage, read> atlas : array<u32>;
 
 const TILE_PX : u32 = 28u;
-const TILE_LEN : u32 = TILE_PX * TILE_PX;
-// An instance that is not a thumbnail. Also what the vertex stage forwards when
-// thumbnails are switched off, so the fragment has one thing to test.
+const TILE_WORDS : u32 = TILE_PX * TILE_PX / 4u;
+// What the vertex stage forwards for a point drawn as a disc, so the fragment
+// has one thing to test.
 const NO_THUMB : u32 = 0xFFFFFFFFu;
 
 struct VSOut {
@@ -114,10 +122,11 @@ const PALETTE = array<vec3<f32>, 10>(
 // PaCMAP position buffer — no copy, no readback.
 @vertex
 fn vs(
-  @builtin(vertex_index) vi  : u32,
-  @location(0)           p   : vec${d}<f32>,
-  @location(1)           lab : u32,
-  @location(2)           thm : u32,
+  @builtin(vertex_index)   vi  : u32,
+  @builtin(instance_index) ii  : u32,
+  @location(0)             p   : vec${d}<f32>,
+  @location(1)             lab : u32,
+  @location(2)             thm : u32,
 ) -> VSOut {
   var corners = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
@@ -130,7 +139,12 @@ fn vs(
   // smudge rather than a glyph; points keep their own range and digits get
   // theirs. Resolved here so sizeMul is the only thing the size arithmetic
   // below has to know about thumbnails, at either dimensionality.
-  let isThumb = V.digits > 0.5 && thm != NO_THUMB;
+  //
+  // Which points are digits is a threshold on their rank — a random
+  // permutation fixed at setup — so the slider adds and removes them spread
+  // through the cloud, and moving it costs one number in this uniform rather
+  // than a rebuilt buffer.
+  let isThumb = f32(thm & 0x7FFFFFFFu) < V.digitCount;
   let sizeMul = select(1.0, V.digitScale, isThumb);
 
   // Data → world. One scale for every axis so the embedding isn't stretched,
@@ -213,7 +227,8 @@ fn vs(
   out.clip = clip;
   out.col  = PALETTE[min(lab, 9u)];
   out.uv   = c;
-  out.thumb = select(NO_THUMB, thm, isThumb);
+  // The tile is this point's own bitmap; only the style bit rides along.
+  out.thumb = select(NO_THUMB, ii | (thm & 0x80000000u), isThumb);
   ${d === 3 ? "out.fade = fade;" : ""}
   return out;
 }
@@ -255,11 +270,13 @@ fn vs(
 fn texel(base : u32, x : i32, y : i32) -> f32 {
   let cx = u32(clamp(x, 0, i32(TILE_PX) - 1));
   let cy = u32(clamp(y, 0, i32(TILE_PX) - 1));
-  return atlas[base + cy * TILE_PX + cx];
+  let i = cy * TILE_PX + cx;
+  let w = atlas[base + (i >> 2u)];
+  return f32((w >> ((i & 3u) * 8u)) & 0xFFu) / 255.0;
 }
 
 fn thumbColor(thumb : u32, uv : vec2<f32>, col : vec3<f32>) -> vec4<f32> {
-  let base = (thumb & 0x7FFFFFFFu) * TILE_LEN;
+  let base = (thumb & 0x7FFFFFFFu) * TILE_WORDS;
   // Quad space is [-1, 1] with y up; the sprite's row 0 is the top of the
   // digit, so v is flipped here and the digits come out upright.
   let g = vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);

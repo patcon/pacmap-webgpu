@@ -141,61 +141,65 @@ const PALETTE: [number, number, number][] = [
 // Digit thumbnails
 // ---------------------------------------------------------------------------
 
-/** Fraction of points drawn as their actual bitmap rather than as a disc. */
-const THUMB_FRAC = 0.01;
-/** An instance that is not a thumbnail. Matches NO_THUMB in the render shader. */
-const NO_THUMB = 0xffffffff;
+/** u32 words per 28x28 tile, four 8-bit intensities to the word. */
+const TILE_WORDS = IMAGE_SIZE / 4;
 
 /**
- * Pick a sample of points to draw as digits, and pack their bitmaps into one
- * tile-major atlas.
+ * Pack every digit into one atlas, and give every point a rank deciding how
+ * early it becomes a thumbnail.
  *
- * The per-instance `thumb` attribute this returns carries both halves of the
- * decision: NO_THUMB for an ordinary point, otherwise the tile index in the low
- * 31 bits and the style coinflip in the top one. One attribute rather than two
- * because they are read together and can never be meaningful apart.
+ * The atlas holds *all* N bitmaps rather than a sampled subset, which is what
+ * lets the `digit %` slider be a render-time control: it moves a threshold
+ * against the rank, so no buffer is rebuilt and no run is restarted. That is
+ * affordable only because the intensities are quantized back to the 8 bits they
+ * arrived as — 784 bytes a digit, ~51MB at N=65k, against ~204MB as f32 and a
+ * 128MB default limit on a storage binding. The tile index is then just the
+ * point index, so nothing has to map one to the other.
  *
- * The atlas is a plain f32 storage buffer rather than an r8unorm texture — see
- * the binding in shaders.ts for why. 1% of 65k is 650 tiles, so it costs about
- * 2MB, which is nothing beside the position history.
+ * The per-instance `thumb` attribute carries the rank in the low 31 bits and
+ * the style coinflip in the top one. One attribute rather than two because they
+ * are read together and can never be meaningful apart.
  *
- * The selection is drawn from the run's seed, so the same seed picks the same
- * digits and the same styles — otherwise comparing two runs would also be
- * comparing two different samples.
+ * Rank is a random permutation, so raising the slider adds digits spread
+ * through the cloud rather than walking along the sample order. Both it and the
+ * coinflip come from the run's seed: two runs at one seed show the same digits
+ * in the same styles, or comparing them would also be comparing two samples.
  *
  * Must be called *before* `pcaProject`, which runs with `inPlace: true` and
  * overwrites X. Reading it afterwards yields plausible noise rather than an
  * error.
  */
-function buildDigitThumbs(X: Float32Array, N: number, seed: number) {
+function buildDigitAtlas(X: Float32Array, N: number, seed: number) {
   const rand = mulberry32(seed ^ 0x7d1);
-  const count = Math.min(N, Math.floor(N * THUMB_FRAC));
 
-  // Partial Fisher-Yates: `count` distinct indices without rejection sampling,
-  // which degrades as the sample approaches N.
-  const pool = new Uint32Array(N);
-  for (let i = 0; i < N; i++) pool[i] = i;
-  for (let i = 0; i < count; i++) {
-    const j = i + Math.floor(rand() * (N - i));
-    const t = pool[i];
-    pool[i] = pool[j];
-    pool[j] = t;
+  // Full Fisher-Yates: rank[i] is where point i falls in a random order.
+  const rank = new Uint32Array(N);
+  for (let i = 0; i < N; i++) rank[i] = i;
+  for (let i = N - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    const t = rank[i];
+    rank[i] = rank[j];
+    rank[j] = t;
   }
 
-  const thumbs = new Uint32Array(N).fill(NO_THUMB);
-  // At least one tile: a zero-length storage buffer is not a legal binding, and
-  // N below 100 rounds the sample down to none.
-  const atlas = new Float32Array(Math.max(1, count) * IMAGE_SIZE);
-  for (let t = 0; t < count; t++) {
-    const style = rand() < 0.5 ? 0 : 0x80000000;
-    thumbs[pool[t]] = (t | style) >>> 0;
-    atlas.set(
-      X.subarray(pool[t] * IMAGE_SIZE, (pool[t] + 1) * IMAGE_SIZE),
-      t * IMAGE_SIZE
-    );
+  const thumbs = new Uint32Array(N);
+  // At least one tile: a zero-length storage buffer is not a legal binding.
+  const atlas = new Uint32Array(Math.max(1, N) * TILE_WORDS);
+  for (let i = 0; i < N; i++) {
+    thumbs[i] = (rank[i] | (rand() < 0.5 ? 0 : 0x80000000)) >>> 0;
+    const src = i * IMAGE_SIZE;
+    const dst = i * TILE_WORDS;
+    for (let w = 0; w < TILE_WORDS; w++) {
+      const p = src + w * 4;
+      atlas[dst + w] =
+        ((X[p] * 255) & 0xff) |
+        (((X[p + 1] * 255) & 0xff) << 8) |
+        (((X[p + 2] * 255) & 0xff) << 16) |
+        (((X[p + 3] * 255) & 0xff) << 24);
+    }
   }
 
-  return { thumbs, atlas, count };
+  return { thumbs, atlas };
 }
 
 /** Duplicated from pca.ts / pacmap-webgpu.ts, which keep it module-private so
@@ -257,7 +261,7 @@ async function go() {
     const { X, labels } = await loadMnist(N, status);
 
     // Before the PCA below, which runs in place and overwrites X.
-    const thumbs = buildDigitThumbs(X, N, params.seed);
+    const thumbs = buildDigitAtlas(X, N, params.seed);
 
     status("Projecting 784d → 100d (randomized PCA)…");
     await frame();
@@ -352,7 +356,7 @@ async function go() {
       usage: GPUBufferUsage.STORAGE,
       mappedAtCreation: true,
     });
-    new Float32Array(atlasBuf.getMappedRange()).set(thumbs.atlas);
+    new Uint32Array(atlasBuf.getMappedRange()).set(thumbs.atlas);
     atlasBuf.unmap();
 
     const boundsStorage = device.createBuffer({
@@ -570,7 +574,9 @@ async function go() {
       m[17] = canvas.height;
       m[18] = radius;
       m[19] = occludingNow() ? 1 : 0;
-      m[20] = view.digits ? 1 : 0;
+      // The slider is a percentage; the shader compares against a rank, so the
+      // resolution against N happens here rather than needing N in the shader.
+      m[20] = (view.digitPct / 100) * N;
       m[21] = view.digitScale;
       device.queue.writeBuffer(viewUniform, 0, m);
 
@@ -936,7 +942,9 @@ const view = {
   pointSize: 1.8,
   autoZoom: true,
   occlusion: true,
-  digits: true,
+  // What share of points draw as their own bitmap. Live, because the atlas
+  // holds every digit and this only moves a threshold; 0 is no digits at all.
+  digitPct: 1,
   // A digit at the point size would be a few pixels across — a smudge, not a
   // glyph — so thumbnails get their own multiplier rather than dragging the
   // whole cloud up with them.
@@ -1151,7 +1159,12 @@ const occlusionBinding = viewFolder
 // Both ride in the view uniform like `occlusion`, so there is nothing to
 // install for them either.
 viewFolder
-  .addBinding(view, "digits", { label: "digit thumbs" })
+  .addBinding(view, "digitPct", {
+    label: "digit %",
+    min: 0,
+    max: 100,
+    step: 0.5,
+  })
   .on("change", () => onViewChange?.());
 viewFolder
   .addBinding(view, "digitScale", {
