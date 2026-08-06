@@ -28,6 +28,7 @@
 
 import { pacmapWebGPU, shaderSources } from "../src/pacmap-webgpu";
 import { boundsWGSL } from "../src/shaders";
+import { buildEdgeIndices, EDGE_KINDS } from "../src/edges";
 import { openDawn, upload, readback, rng } from "./dawn";
 
 const STRICT = process.argv.includes("--strict");
@@ -760,6 +761,126 @@ async function checkGraph(device: GPUDevice): Promise<void> {
   check("graph/nb-rank-is-nearest", qNB < 0.05, seen);
   check("graph/mn-rank-is-mid", qMN > 0.15 && qMN < 0.42, seen);
   check("graph/fp-rank-is-uniform", qFP > 0.45, seen);
+
+  // --- The overlay's index buffer ----------------------------------------
+  // `check:shaders` proves the edge pipelines build and that a draw can be
+  // encoded under them. It cannot see whether an edge lands on the two points
+  // it belongs to, because nothing headless renders a pixel — but that is an
+  // off-by-one in an index buffer, which is checkable as *data* even when it is
+  // not checkable as an image. This is why `buildEdgeIndices` lives in
+  // `src/edges.ts` rather than in `main.ts` with the rest of the renderer.
+  const built = buildEdgeIndices(pm.graph, E2E_N, rng(99));
+  const { indices, ranges } = built;
+
+  // Every drawn line is a pair the optimizer actually holds. The oracle is the
+  // graph itself as a set of (i, j) strings — the index buffer's own layout is
+  // what is under test, so nothing here may reconstruct it the same way.
+  const asSet = (arr: Uint32Array, width: number) => {
+    const s = new Set<string>();
+    for (let i = 0; i < E2E_N; i++) {
+      for (let k = 0; k < width; k++) {
+        const j = arr[i * width + k];
+        if (j < E2E_N) s.add(`${i},${j}`);
+      }
+    }
+    return s;
+  };
+  const expect: Record<string, Set<string>> = {
+    near: asSet(nbFwd, nNB),
+    midNear: asSet(mnFwd, nMN),
+    further: asSet(fpFwd, nFP),
+  };
+
+  let sum = 0;
+  for (const kind of EDGE_KINDS) {
+    const { first, count } = ranges[kind];
+    sum += count;
+
+    let wrong = 0;
+    let outOfRange = 0;
+    for (let e = 0; e < count; e++) {
+      const i = indices[first + e * 2];
+      const j = indices[first + e * 2 + 1];
+      if (i >= E2E_N || j >= E2E_N) outOfRange++;
+      else if (!expect[kind].has(`${i},${j}`)) wrong++;
+    }
+    check(`edges/${kind}-endpoints-in-range`, outOfRange === 0, `${outOfRange}`);
+    // The one that would otherwise be browser-only: an edge of this kind
+    // connects a point to one of *its* partners of that kind. A shuffle that
+    // swapped individual indices rather than whole pairs rewires the graph
+    // while leaving every count and every bound intact.
+    check(`edges/${kind}-edges-are-real-pairs`, wrong === 0, `${wrong} of ${count}`);
+
+    // A prefix has to be a uniform sample, or the percentage slider would walk
+    // along the sample order and add edges from one end of the cloud. With N
+    // points in ascending source order, an unshuffled range has a strictly
+    // non-decreasing first endpoint; a shuffled one descends about half the
+    // time. 0.4 is a wide margin around that 0.5.
+    let descents = 0;
+    for (let e = 1; e < count; e++) {
+      if (indices[first + e * 2] < indices[first + (e - 1) * 2]) descents++;
+    }
+    const frac = count > 1 ? descents / (count - 1) : 1;
+    check(
+      `edges/${kind}-range-is-shuffled`,
+      frac > 0.4,
+      `${(frac * 100).toFixed(1)}% descending`
+    );
+  }
+
+  // No gaps and no overlap: the three ranges tile the buffer exactly, which is
+  // what makes firstIndex arithmetic safe.
+  check(
+    "edges/ranges-tile-the-buffer",
+    sum * 2 === indices.length &&
+      ranges.near.first === 0 &&
+      ranges.midNear.first === ranges.near.count * 2 &&
+      ranges.further.first === (ranges.near.count + ranges.midNear.count) * 2,
+    `${sum} pairs vs ${indices.length / 2}`
+  );
+
+  // Same seed, same sample — otherwise comparing two runs would also be
+  // comparing two different subsets of the graph.
+  const again = buildEdgeIndices(pm.graph, E2E_N, rng(99));
+  check(
+    "edges/reproducible-at-one-seed",
+    again.indices.every((v, k) => v === indices[k])
+  );
+
+  // The pad-skipping branch, on a synthetic graph rather than a real run.
+  // `nbFwd` pads a row only when the candidate pool is smaller than nNB, which
+  // needs N <= nNeighbors — so the N=400 fixture above never reaches it, and
+  // returning the whole allocation instead of a subarray passes every check
+  // there. A four-point graph is cheaper than an embedding that small, and it
+  // is the pure function under test either way.
+  {
+    const M = 4;
+    const pad = buildEdgeIndices(
+      {
+        // One real partner and one pad per row.
+        nbFwd: Uint32Array.from([1, M, 2, M, 3, M, 0, M]),
+        mnFwd: Uint32Array.from([2, 3, 0, 1]),
+        fpFwd: Uint32Array.from([3, 0, 1, 2]),
+        nNB: 2,
+        nMN: 1,
+        nFP: 1,
+      },
+      M,
+      rng(5)
+    );
+    check(
+      "edges/pads-are-not-drawn",
+      pad.ranges.near.count === M,
+      `${pad.ranges.near.count} near edges, want ${M}`
+    );
+    // The tail the pads left unused must not ship: a buffer sized from the
+    // allocation ends in zeros, which draw as a line from point 0 to point 0.
+    check(
+      "edges/buffer-has-no-unused-tail",
+      pad.indices.length === 3 * M * 2,
+      `${pad.indices.length} indices, want ${3 * M * 2}`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

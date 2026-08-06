@@ -9,7 +9,14 @@ import {
 import { druidCPU } from "./druid-cpu";
 import { loadMnist, IMAGE_SIZE, NUM_AVAILABLE } from "./mnist";
 import { pcaProject } from "./pca";
-import { boundsWGSL, renderWGSL } from "./shaders";
+import { boundsWGSL, renderWGSL, edgeWGSL } from "./shaders";
+import {
+  buildEdgeIndices,
+  EDGE_KINDS,
+  EDGE_COLORS,
+  EDGE_ALPHA,
+  type EdgeKind,
+} from "./edges";
 import { Pane } from "tweakpane";
 import { Camera, Orbit, Vec3, type OGLRenderingContext } from "ogl";
 
@@ -581,6 +588,139 @@ async function go() {
       ],
     });
 
+    // --- The pair-graph overlay --------------------------------------------
+    // Null under the CPU engines: druid builds its own neighbour graph
+    // internally and exposes nothing, so there is no overlay to offer and the
+    // pane greys the control rather than drawing an empty one.
+    const edges = (() => {
+      if (!pm.graph) return null;
+      // Seeded from the run's seed, so two runs at one seed show the same sample.
+      const built = buildEdgeIndices(pm.graph, N, mulberry32(params.seed ^ 0x3dbe));
+      if (built.indices.length === 0) return null;
+
+      const indexBuf = device.createBuffer({
+        size: built.indices.byteLength,
+        usage: GPUBufferUsage.INDEX,
+        mappedAtCreation: true,
+      });
+      new Uint32Array(indexBuf.getMappedRange()).set(built.indices);
+      indexBuf.unmap();
+
+      // One 256-byte-aligned slot per kind, addressed by dynamic offset. The
+      // kind cannot ride in a vertex attribute — on an indexed draw
+      // `vertex_index` is the fetched index value, not the position in the
+      // index buffer — so it arrives per draw instead. Same mechanism the
+      // optimizer uses for its per-iteration weights.
+      const align = device.limits.minUniformBufferOffsetAlignment || 256;
+      const styles = new Float32Array((align / 4) * EDGE_KINDS.length);
+      EDGE_KINDS.forEach((kind, k) => {
+        styles.set([...EDGE_COLORS[kind], EDGE_ALPHA], (k * align) / 4);
+      });
+      const styleBuf = device.createBuffer({
+        size: styles.byteLength,
+        usage: GPUBufferUsage.UNIFORM,
+        mappedAtCreation: true,
+      });
+      new Float32Array(styleBuf.getMappedRange()).set(styles);
+      styleBuf.unmap();
+
+      const bgl = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+          {
+            // The fragment reads this one too, for the occlude flag.
+            binding: 1,
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform" },
+          },
+          { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 },
+          },
+        ],
+      });
+      const bindGroup = device.createBindGroup({
+        layout: bgl,
+        entries: [
+          { binding: 0, resource: { buffer: boundsUniform } },
+          { binding: 1, resource: { buffer: viewUniform } },
+          { binding: 2, resource: { buffer: boundsUniformB } },
+          { binding: 3, resource: { buffer: styleBuf, size: 16 } },
+        ],
+      });
+
+      // The same two keyframes the point draw binds, at "vertex" step mode
+      // rather than "instance" — same memory, different pipeline, different
+      // layout. An edge is two of these, fetched through the index buffer.
+      const posAttr = (shaderLocation: number): GPUVertexBufferLayout => ({
+        arrayStride: 4 * nComponents,
+        stepMode: "vertex",
+        attributes: [
+          {
+            shaderLocation,
+            offset: 0,
+            format: `float32x${nComponents}` as GPUVertexFormat,
+          },
+        ],
+      });
+      const edgeModule = device.createShaderModule({ code: edgeWGSL(nComponents) });
+      const desc: GPURenderPipelineDescriptor = {
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        vertex: {
+          module: edgeModule,
+          entryPoint: "vs",
+          buffers: [posAttr(0), posAttr(1)],
+        },
+        fragment: {
+          module: edgeModule,
+          entryPoint: "fs",
+          targets: [
+            {
+              format,
+              blend: {
+                color: {
+                  srcFactor: "src-alpha",
+                  dstFactor: "one-minus-src-alpha",
+                  operation: "add",
+                },
+                alpha: {
+                  srcFactor: "one",
+                  dstFactor: "one-minus-src-alpha",
+                  operation: "add",
+                },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "line-list" },
+      };
+      return {
+        indexBuf,
+        styleBuf,
+        ranges: built.ranges,
+        align,
+        pipe: device.createRenderPipeline(desc),
+        // Not optional: when occlusion is on the pass carries a depth
+        // attachment, and a pipeline without depth state cannot be used in a
+        // pass that has one. That is a validation error, not a difference in
+        // how it looks.
+        pipeDepth:
+          nComponents === 3
+            ? device.createRenderPipeline({
+                ...desc,
+                depthStencil: {
+                  format: DEPTH_FORMAT,
+                  depthWriteEnabled: true,
+                  depthCompare: "less",
+                },
+              })
+            : null,
+        bindGroup,
+      };
+    })();
+
     function resize() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
@@ -720,6 +860,26 @@ async function go() {
             }
           : {}),
       });
+      // Edges first, into the same pass, so the points land on top of them. A
+      // second pass with loadOp "load" would work and costs a pass per frame
+      // for nothing.
+      if (edges && view.edges) {
+        rp.setPipeline(occlude ? edges.pipeDepth! : edges.pipe);
+        rp.setVertexBuffer(0, posBuf, offset, frameBytes);
+        rp.setVertexBuffer(1, posBuf, offsetB, frameBytes);
+        rp.setIndexBuffer(edges.indexBuf, "uint32");
+        EDGE_KINDS.forEach((kind, k) => {
+          const { first, count } = edges.ranges[kind];
+          // The percentage resolved against this range's own total. Because
+          // the range was shuffled at setup, a prefix is a uniform sample of
+          // that kind — so this is the whole of the control.
+          const drawn = Math.round((view.edgePct[kind] / 100) * count);
+          if (drawn === 0) return;
+          rp.setBindGroup(0, edges.bindGroup, [k * edges.align]);
+          rp.drawIndexed(drawn * 2, 1, first);
+        });
+      }
+
       rp.setPipeline(occlude ? renderPipeDepth! : renderPipe);
       rp.setBindGroup(0, renderBG);
       rp.setVertexBuffer(0, posBuf, offset, frameBytes);
@@ -1052,6 +1212,15 @@ const view = {
   // two drawn frames per pair there, more on a faster display. Capped at 60,
   // above which it only skips keyframes.
   playbackFps: 30,
+  // The pair-graph overlay. Off by default: the point cloud is the thing being
+  // demonstrated and three million lines over it is a wash of colour.
+  edges: false,
+  // Per kind, because the three counts differ by 4x and so does the useful
+  // percentage. Further pairs connect everything to everything by construction,
+  // so a few percent of them reads as outward pressure where all of them reads
+  // as fog. Render-time: the index buffer holds every pair and this moves a
+  // draw count. Sliders are Task 3; these are the values it will default to.
+  edgePct: { near: 100, midNear: 100, further: 5 } as Record<EdgeKind, number>,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
@@ -1438,6 +1607,13 @@ viewFolder
     max: 60,
     step: 1,
   })
+  .on("change", () => onViewChange?.());
+// The pair-graph overlay. One checkbox for now; the per-kind percentages are
+// still constants in `view.edgePct`, and get their own folder with sliders next.
+// Live like everything else here — it changes which draws are encoded, and the
+// index buffer holding every pair is what lets that cost nothing.
+viewFolder
+  .addBinding(view, "edges", { label: "show edges" })
   .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.
 viewFolder

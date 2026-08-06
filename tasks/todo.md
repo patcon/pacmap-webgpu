@@ -43,30 +43,49 @@ mid-run further-pair resample (red edges are the initial draw — documented, no
 
 ## Phase 2 — The renderer
 
-- [ ] **2. Edge shader, both pipelines, index buffer, draw** — L — deps: 1
-      `src/shaders.ts`, `src/main.ts`, `scripts/check-shaders.ts`
-      - [ ] `edgeWGSL(d)`: bindings 0/1/2 are the point shader's `Bounds` A / `View` /
-            `Bounds` B verbatim; binding 3 is the per-kind colour, `hasDynamicOffset`
-      - [ ] Vertex buffers 0/1 are the two keyframes at `stepMode: "vertex"`;
+- [x] **2. Edge shader, both pipelines, index buffer, draw** — L — deps: 1
+      `src/shaders.ts`, `src/edges.ts` (new), `src/main.ts`, `scripts/check-shaders.ts`,
+      `scripts/check-kernels.ts`
+      - [x] `edgeWGSL(d)`: bindings 0/1/2 are `Bounds` A / `View` / `Bounds` B; binding 3
+            is the per-kind colour, `hasDynamicOffset`
+      - [x] The two uniform structs and the data→world mapping are **shared text**
+            (`BOUNDS_STRUCT`, `VIEW_STRUCT`, `worldStatements`) spliced into both shaders,
+            so an edge cannot be placed by different arithmetic than its endpoints.
+            Verified `renderWGSL`'s output is unchanged: every non-comment line identical
+            at d=2 and d=3 against HEAD
+      - [x] Vertex buffers 0/1 are the two keyframes at `stepMode: "vertex"`;
             `mix(p, pB, V.lerpT)` → world → `V.viewProj`. No quad, no radius
-      - [ ] Fragment alpha 0.35 blended, **1.0 when occluding** — a semi-transparent
-            fragment that writes depth is the dark-streak failure
-      - [ ] Index buffer built at setup: three contiguous ranges, each shuffled from the
+      - [x] Fragment alpha 0.35 blended, **1.0 when occluding**
+      - [x] Index buffer built at setup: three contiguous ranges, each shuffled from the
             run's seed so a prefix is a uniform sample and two runs at one seed agree
-      - [ ] 3-slot dynamic-offset colour uniform (256-byte stride) — near green,
-            mid-near yellow, further red
-      - [ ] `edgePipe` / `edgePipeDepth` from one descriptor, depth only in 3D, selected
-            by the existing `occludingNow()` — **mandatory, not optional:** a pipeline
-            without depth state cannot be used in a pass that has a depth attachment
-      - [ ] Encoded **first**, same pass as the points, same two vertex-buffer offsets;
+      - [x] 3-slot dynamic-offset colour uniform — near green, mid-near yellow, further red
+      - [x] `pipe` / `pipeDepth` from one descriptor, depth only in 3D, selected by the
+            existing `occludingNow()` — **mandatory:** a pipeline without depth state
+            cannot be used in a pass that has a depth attachment
+      - [x] Encoded **first**, same pass as the points, same two vertex-buffer offsets;
             three `drawIndexed` calls, skipped at count 0
-      - [ ] `view.edges = false`; proportions hard-coded to 100 / 100 / 5 for now
-      - [ ] `check:shaders`: `edge-{2,3}d{,-depth}` pipeline cases, and the existing
-            `render-3d-occlusion-draw` bundle gains an edge `drawIndexed` under both modes
-      - [ ] Demonstrate failing first: `uint16` index format against a `uint32` buffer;
-            depth state dropped from `edgePipeDepth` while the bundle declares a depth
-            format
-      - [ ] `check:ab` prints 0
+      - [x] `view.edges = false` plus a `show edges` checkbox in `rendering` (the plan's
+            "behind one checkbox" — without it none of the browser steps are reachable);
+            `view.edgePct` hard-coded to 100 / 100 / 5 until Task 3
+      - [x] **`buildEdgeIndices` moved to its own DOM-free `src/edges.ts`.** It is the one
+            piece of the overlay whose mistakes are off-by-ones rather than validation
+            errors, and stranding it in `main.ts` would have made it permanently
+            browser-only. Now checked as data (11 new `edges/*` checks)
+      - [x] `check:shaders`: `edge-{2,3}d{,-depth}` pipeline cases plus an
+            `edge-3d-occlusion-draw` bundle case (11 → 15)
+      - [x] Demonstrated failing first — five mutations:
+            shuffle swapping single indices rather than whole pairs (3 checks, 3874/4000
+            wrong); no shuffle at all (3 checks, 0% descending); returning the whole
+            allocation rather than the subarray; drawing the pad entries; a WGSL error in
+            `edgeWGSL` (all 4 shader cases). Plus, on the draw case: no `setIndexBuffer`,
+            depth state dropped while the bundle declares a depth format, and a
+            misaligned dynamic offset
+      - [x] **Two planned mutations do *not* fail, checked rather than assumed:**
+            `setIndexBuffer` with `uint16` against a u32 buffer (the format is a
+            byte-width declaration, not a claim about contents) and a `float32x2`
+            attribute against a `vec3<f32>` input (WebGPU fills the missing components).
+            The check-shaders comment now says so rather than claiming coverage it lacks
+      - [x] `check:ab` bit-identical on both variants
       - [ ] **Browser (yours):** 2D, 2k, PaCMAP — green mesh in clusters, yellow between
             them, red spanning. Zoom in on one point: its green edges terminate *on* it
       - [ ] **Browser (yours):** scrub with `interpolation` on — edges never lag their

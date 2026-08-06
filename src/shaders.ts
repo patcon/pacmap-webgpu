@@ -46,25 +46,27 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
 }
 `;
 
-/**
- * The point renderer, templated on the embedding's width.
- *
- * `d` decides two things and nothing else: the vertex attribute's type, and
- * whether the world position takes its z from the data or from the constant 0
- * the 2D path has always passed. Everything downstream — the projection, the
- * screen-space quad, the fragment — is already dimension-agnostic.
- */
-export const renderWGSL = (d = 2, refDist = 2.414213562373095) => /* wgsl */ `
+// The two uniform structs and the data→world mapping, as text, because the
+// point renderer and the edge overlay below have to agree about all three
+// exactly. An edge whose endpoints are placed by even slightly different
+// arithmetic than the points it connects would detach from them, and the
+// framing is mixed per frame so the disagreement would come and go — which is
+// the kind of bug that is hunted for hours rather than noticed.
+//
+// Spliced in rather than factored into a WGSL function, so `renderWGSL`'s
+// output stays character-for-character what it was before the overlay existed.
+
 // 32 bytes. vec4 rather than vec3 because a vec3 in a uniform pads to 16 bytes
 // anyway, so the padded form is free — and it keeps one buffer size, one
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
 // instead of a layout that changes with a dropdown.
-struct Bounds { lo : vec4<f32>, hi : vec4<f32> };
+const BOUNDS_STRUCT = `struct Bounds { lo : vec4<f32>, hi : vec4<f32> };`;
+
 // Exactly 96 bytes: mat4 64 + vec2 8 + f32 x 6. It used to be 92 padded to 96
 // by the mat4's 16-byte alignment; lerpT took the padding, as occlude took the
 // slot before it. viewProj already carries the WebGL-to-WebGPU depth remap (see
 // resize() in main.ts), so it is used as-is.
-struct View {
+const VIEW_STRUCT = `struct View {
   viewProj   : mat4x4<f32>,
   res        : vec2<f32>,
   radius     : f32,
@@ -81,7 +83,49 @@ struct View {
   // stage mixes them; 0 draws keyframe A exactly, which is what the live path
   // and an unticked "interpolation" both leave it at.
   lerpT      : f32,
-};
+};`;
+
+/**
+ * Data → world, as statements. Reads `p`, `pB`, `B`, `B2` and `V` from the
+ * surrounding scope and defines `w`; every consumer declares those bindings
+ * under those names, whatever binding numbers it gives them.
+ */
+const worldStatements = (d: number) => `
+  // One scale for every axis so the embedding isn't stretched, and centred on
+  // the origin, which is why the camera never has to re-fit: the bounds reduce
+  // keeps doing the framing and the camera only moves when the user moves it.
+  // In 2D the box's z extent is exactly 0, so one span expression serves both —
+  // measured, a 3D layout comes out near-isotropic (per-axis spreads within 3%
+  // of each other), so one span frames it well.
+  //
+  // The box is mixed on the same t as the position. Under "auto zoom" each
+  // keyframe is framed by its own banked bound, so a snapping box under gliding
+  // points would pulse once per keyframe; held, both bindings carry the same
+  // box and the mix is a no-op.
+  let lo   = mix(B.lo, B2.lo, V.lerpT);
+  let hi   = mix(B.hi, B2.hi, V.lerpT);
+  let ctr  = (lo.xyz + hi.xyz) * 0.5;
+  let ext  = hi.xyz - lo.xyz;
+  let span = max(max(max(ext.x, ext.y), ext.z), 1e-6);
+  // Straight lerp between adjacent keyframes — no easing, no spline. At lerpT
+  // 0 this is p exactly, so an unticked "interpolation" draws what predates it
+  // bit for bit.
+  let pos = mix(p, pB, V.lerpT);
+  let w = ${d === 3
+    ? "(pos - ctr) / (span * 0.55)"
+    : "vec3<f32>((pos - ctr.xy) / (span * 0.55), 0.0)"};`;
+
+/**
+ * The point renderer, templated on the embedding's width.
+ *
+ * `d` decides two things and nothing else: the vertex attribute's type, and
+ * whether the world position takes its z from the data or from the constant 0
+ * the 2D path has always passed. Everything downstream — the projection, the
+ * screen-space quad, the fragment — is already dimension-agnostic.
+ */
+export const renderWGSL = (d = 2, refDist = 2.414213562373095) => /* wgsl */ `
+${BOUNDS_STRUCT}
+${VIEW_STRUCT}
 
 // A and B: the two keyframes being mixed. Two 32-byte bindings rather than one
 // 64-byte struct, so BOUNDS_BYTES keeps meaning both the history slot stride
@@ -163,29 +207,8 @@ fn vs(
   let isThumb = f32(thm) < V.digitCount;
   let sizeMul = select(1.0, V.digitScale, isThumb);
 
-  // Data → world. One scale for every axis so the embedding isn't stretched,
-  // and centred on the origin, which is why the camera never has to re-fit: the
-  // bounds reduce keeps doing the framing and the camera only moves when the
-  // user moves it. In 2D the box's z extent is exactly 0, so one span
-  // expression serves both — measured, a 3D layout comes out near-isotropic
-  // (per-axis spreads within 3% of each other), so one span frames it well.
-  //
-  // The box is mixed on the same t as the position. Under "auto zoom" each
-  // keyframe is framed by its own banked bound, so a snapping box under gliding
-  // points would pulse once per keyframe; held, both bindings carry the same
-  // box and the mix is a no-op.
-  let lo   = mix(B.lo, B2.lo, V.lerpT);
-  let hi   = mix(B.hi, B2.hi, V.lerpT);
-  let ctr  = (lo.xyz + hi.xyz) * 0.5;
-  let ext  = hi.xyz - lo.xyz;
-  let span = max(max(max(ext.x, ext.y), ext.z), 1e-6);
-  // Straight lerp between adjacent keyframes — no easing, no spline. At lerpT
-  // 0 this is p exactly, so an unticked "interpolation" draws what predates it
-  // bit for bit.
-  let pos = mix(p, pB, V.lerpT);
-  let w = ${d === 3
-    ? "(pos - ctr) / (span * 0.55)"
-    : "vec3<f32>((pos - ctr.xy) / (span * 0.55), 0.0)"};
+  // Data → world. Shared verbatim with the edge overlay — see worldStatements.
+${worldStatements(d)}
   // The projection owns the aspect divide now, so there is none here.
   var clip = V.viewProj * vec4<f32>(w, 1.0);
 
@@ -355,5 +378,72 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   if (V.occlude > 0.5) { return vec4<f32>(in.col, 1.0); }
   return vec4<f32>(in.col, (1.0 - smoothstep(0.7, 1.0, d)) * 0.85);
   `}
+}
+`;
+
+/**
+ * The pair-graph overlay: near, mid-near and further pairs as coloured lines.
+ *
+ * An **indexed** `line-list` over the same position buffer the point renderer
+ * binds, which is what makes this cheap. The alternatives were both worse:
+ *
+ *   - Positions as a storage buffer, indexed per edge. That needs a dynamic
+ *     offset to reach a playback keyframe, and a storage binding's dynamic
+ *     offset must be 256-byte aligned — `frameBytes = N*4*d` generally is not
+ *     (520,000 at N=65k, d=2). Binding all of `posHistory` instead runs into
+ *     its 128MB budget being exactly the default maxStorageBufferBindingSize.
+ *   - A second render pass. One more pass per frame to no end; the points are
+ *     drawn straight after these into the same one.
+ *
+ * Indexing also makes playback interpolation free: slot `a` goes to vertex
+ * buffer 0 and slot `b` to vertex buffer 1, and the mix below is the same one
+ * the point shader runs, from the same shared text.
+ *
+ * What it costs is that the pair *kind* cannot be a vertex attribute — on an
+ * indexed draw `@builtin(vertex_index)` is the fetched index value, not the
+ * position in the index buffer, so it cannot be compared against a range
+ * boundary. So the kind is not in the shader at all: one index buffer holds the
+ * three kinds in three contiguous ranges, and the colour arrives per draw
+ * through a dynamic-offset uniform. Same mechanism the optimizer already uses
+ * for its per-iteration weights.
+ *
+ * Line width is always one device pixel in WebGPU — there is no lineWidth — so
+ * there is nothing to expose for it short of drawing quads.
+ */
+export const edgeWGSL = (d = 2) => /* wgsl */ `
+${BOUNDS_STRUCT}
+${VIEW_STRUCT}
+// One vec4 per pair kind, selected by dynamic offset at draw time. Only .rgb
+// and .a are read; the alpha is a flat constant, deliberately not scaled by the
+// pair's weight or the schedule's phase (see the pane).
+struct EdgeStyle { color : vec4<f32> };
+
+// Same names as the point shader, because worldStatements below is the same
+// text. The binding *numbers* differ — there is no atlas here — which is fine:
+// the shared statements refer to B, B2 and V and never to a binding index.
+@group(0) @binding(0) var<uniform> B  : Bounds;
+@group(0) @binding(1) var<uniform> V  : View;
+@group(0) @binding(2) var<uniform> B2 : Bounds;
+@group(0) @binding(3) var<uniform> E  : EdgeStyle;
+
+@vertex
+fn vs(
+  @location(0) p  : vec${d}<f32>,
+  // The next keyframe. On playback this is the same buffer as location 0, one
+  // history slot along.
+  @location(1) pB : vec${d}<f32>,
+) -> @builtin(position) vec4<f32> {
+${worldStatements(d)}
+  return V.viewProj * vec4<f32>(w, 1.0);
+}
+
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+  // Opaque when occluding. A semi-transparent fragment that writes depth culls
+  // everything behind it while compositing against the background — the same
+  // dark-streak failure the point shader's occluded branch avoids, and a line
+  // laid across a cluster would draw a very visible one.
+  if (V.occlude > 0.5) { return vec4<f32>(E.color.rgb, 1.0); }
+  return E.color;
 }
 `;

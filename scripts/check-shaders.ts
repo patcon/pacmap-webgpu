@@ -20,7 +20,7 @@
  */
 
 import { shaderSources } from "../src/pacmap-webgpu";
-import { boundsWGSL, renderWGSL } from "../src/shaders";
+import { boundsWGSL, renderWGSL, edgeWGSL } from "../src/shaders";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -409,6 +409,182 @@ const cases: Case[] = [
         // one history buffer bound twice at two offsets.
         bundle.setVertexBuffer(3, positions);
         bundle.draw(6, M);
+        bundle.finish();
+      }
+    },
+  },
+  // The pair-graph overlay. Its own pipelines, and — like the points — a depth
+  // variant, because when occlusion is on the pass carries a depth attachment
+  // and a pipeline without depth state cannot be used in one. That is a
+  // validation error rather than a look, so it has to be built here.
+  ...DIMS.flatMap((d) =>
+    (d === 3 ? [false, true] : [false]).map((depth) => ({
+      name: `edge-${d}d${depth ? "-depth" : ""}`,
+      code: edgeWGSL(d),
+      build: (device: GPUDevice, module: GPUShaderModule) => {
+        device.createRenderPipeline({
+          layout: "auto",
+          vertex: {
+            module,
+            entryPoint: "vs",
+            buffers: [0, 1].map((shaderLocation) => ({
+              // "vertex", not "instance": the point pipeline binds these same
+              // two buffers per instance. An edge is two vertices fetched
+              // through the index buffer instead.
+              arrayStride: 4 * d,
+              stepMode: "vertex" as const,
+              attributes: [
+                {
+                  shaderLocation,
+                  offset: 0,
+                  format: `float32x${d}` as GPUVertexFormat,
+                },
+              ],
+            })),
+          },
+          fragment: {
+            module,
+            entryPoint: "fs",
+            targets: [{ format: "bgra8unorm" as const }],
+          },
+          primitive: { topology: "line-list" as const },
+          ...(depth
+            ? {
+                depthStencil: {
+                  format: DEPTH_FORMAT,
+                  depthWriteEnabled: true,
+                  depthCompare: "less" as const,
+                },
+              }
+            : {}),
+        });
+      },
+    }))
+  ),
+  {
+    // The overlay's draw, for the same reasons the point one is encoded: a
+    // valid pipeline says nothing about whether the bind group can be set under
+    // it or whether the target carries the attachments its state demands.
+    //
+    // Three mutations were confirmed to fail here: dropping `setIndexBuffer`,
+    // building the occluded pipeline without depth state while the bundle
+    // declares a depth format, and a dynamic offset that is not a multiple of
+    // minUniformBufferOffsetAlignment. The dynamic-offset uniform is the one
+    // binding kind whose offset can be wrong without the layout noticing, so
+    // that last one is the reason this case sets the bind group per kind rather
+    // than once.
+    //
+    // What it does *not* catch, checked rather than assumed: `setIndexBuffer`
+    // with "uint16" against a u32 index buffer passes, because the format is a
+    // byte-width declaration and not a claim about the contents. Nor does a
+    // `float32x2` attribute against a `vec3<f32>` input — WebGPU fills the
+    // missing components. Both of those are data mistakes, and data mistakes in
+    // this renderer are visible only as pixels, which nothing headless produces.
+    name: "edge-3d-occlusion-draw",
+    code: edgeWGSL(3),
+    build: (device, module) => {
+      const E = 8; // edges; the count is irrelevant, the encoding is not
+      const bgl = device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" as const },
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform" as const },
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" as const },
+          },
+          {
+            // One slot per pair kind, selected per draw.
+            binding: 3,
+            visibility: GPUShaderStage.FRAGMENT,
+            buffer: {
+              type: "uniform" as const,
+              hasDynamicOffset: true,
+              minBindingSize: 16,
+            },
+          },
+        ],
+      });
+      const desc: GPURenderPipelineDescriptor = {
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        vertex: {
+          module,
+          entryPoint: "vs",
+          buffers: [0, 1].map((shaderLocation) => ({
+            arrayStride: 12,
+            stepMode: "vertex" as const,
+            attributes: [
+              { shaderLocation, offset: 0, format: "float32x3" as const },
+            ],
+          })),
+        },
+        fragment: {
+          module,
+          entryPoint: "fs",
+          targets: [{ format: "rgba8unorm" as const }],
+        },
+        primitive: { topology: "line-list" as const },
+      };
+      const blended = device.createRenderPipeline(desc);
+      const occluded = device.createRenderPipeline({
+        ...desc,
+        depthStencil: {
+          format: DEPTH_FORMAT,
+          depthWriteEnabled: true,
+          depthCompare: "less" as const,
+        },
+      });
+
+      const align = device.limits.minUniformBufferOffsetAlignment || 256;
+      const KINDS = 3;
+      const uniform = (size: number) =>
+        device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM });
+      const bindGroup = device.createBindGroup({
+        layout: bgl,
+        entries: [
+          { binding: 0, resource: { buffer: uniform(32) } }, // Bounds A
+          { binding: 1, resource: { buffer: uniform(96) } }, // View
+          { binding: 2, resource: { buffer: uniform(32) } }, // Bounds B
+          {
+            binding: 3,
+            resource: { buffer: uniform(align * KINDS), size: 16 },
+          },
+        ],
+      });
+      const positions = device.createBuffer({
+        size: E * 2 * 12,
+        usage: GPUBufferUsage.VERTEX,
+      });
+      const indices = device.createBuffer({
+        size: E * 2 * 4,
+        usage: GPUBufferUsage.INDEX,
+      });
+
+      for (const occlude of [false, true]) {
+        const bundle = device.createRenderBundleEncoder({
+          colorFormats: ["rgba8unorm"],
+          ...(occlude ? { depthStencilFormat: DEPTH_FORMAT } : {}),
+        });
+        bundle.setPipeline(occlude ? occluded : blended);
+        bundle.setVertexBuffer(0, positions);
+        // The same buffer as slot 0, which is what playback does — one history
+        // buffer bound twice, at two keyframe offsets.
+        bundle.setVertexBuffer(1, positions);
+        bundle.setIndexBuffer(indices, "uint32");
+        for (let k = 0; k < KINDS; k++) {
+          bundle.setBindGroup(0, bindGroup, [k * align]);
+          // A prefix of this kind's range, which is what the percentage
+          // control resolves to — a count and a firstIndex, nothing else.
+          bundle.drawIndexed(2, 1, 0);
+        }
         bundle.finish();
       }
     },
