@@ -316,7 +316,7 @@ async function go() {
     });
 
     const renderModule = device.createShaderModule({
-      code: renderWGSL(nComponents),
+      code: renderWGSL(nComponents, DEFAULT_DIST),
     });
     // Explicit, not "auto". A pipeline created with "auto" gets its own
     // freshly-minted bind group layout, and layouts minted that way are never
@@ -435,8 +435,14 @@ async function go() {
         canvas.height = h;
       }
       // The slider is in CSS px; 1.5 framebuffer px is the floor below which
-      // points stop resolving at all.
-      const radius = Math.max(1.5, view.pointSize * dpr);
+      // points stop resolving at all. In 3D the radius reaching the shader is
+      // no longer the drawn size — it is the size *at the reference distance*,
+      // which depth then scales — so the flat clamp belongs there instead, and
+      // the shader has a better one: it floors the per-point size at 1px and
+      // spends the shortfall as opacity. Clamping here too would only make
+      // every slider value below 1.5/dpr render identically.
+      const radius =
+        nComponents === 3 ? view.pointSize * dpr : Math.max(1.5, view.pointSize * dpr);
 
       camera.perspective({ aspect: w / h });
       // Refreshes viewMatrix and projectionViewMatrix. ogl does this inside
@@ -1007,9 +1013,9 @@ const viewFolder = pane.addFolder({ title: "view" });
 viewFolder
   .addBinding(view, "pointSize", {
     label: "point size",
-    min: 0.2,
+    min: 0.05,
     max: 2,
-    step: 0.1,
+    step: 0.05,
   })
   .on("change", () => onViewChange?.());
 // Nothing to install for this one: the post-run rAF redraws every tick and

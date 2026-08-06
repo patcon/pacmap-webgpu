@@ -54,7 +54,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
  * the 2D path has always passed. Everything downstream — the projection, the
  * screen-space quad, the fragment — is already dimension-agnostic.
  */
-export const renderWGSL = (d = 2) => /* wgsl */ `
+export const renderWGSL = (d = 2, refDist = 2.414213562373095) => /* wgsl */ `
 // 32 bytes. vec4 rather than vec3 because a vec3 in a uniform pads to 16 bytes
 // anyway, so the padded form is free — and it keeps one buffer size, one
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
@@ -72,6 +72,7 @@ struct VSOut {
   @builtin(position) clip : vec4<f32>,
   @location(0)       col  : vec3<f32>,
   @location(1)       uv   : vec2<f32>,
+  ${d === 3 ? "@location(2)       fade : f32," : ""}
 };
 
 const PALETTE = array<vec3<f32>, 10>(
@@ -111,16 +112,60 @@ fn vs(
   // The projection owns the aspect divide now, so there is none here.
   var clip = V.viewProj * vec4<f32>(w, 1.0);
 
+  ${d === 3 ? `
+  // Perspective size, normalized against the default framing distance so
+  // REF_DIST keeps V.radius meaning "pixels at the default framing" rather
+  // than raw view-space depth — the reference viewer this borrows from
+  // (marimo-pacmap-animation/app/app.js) does the same against uRefDist. A
+  // point closer than the reference distance reads bigger, farther reads
+  // smaller: the depth cue 2D deliberately does not want (see below).
+  //
+  // Depth is clip.w — the depth this point is *drawn* at, from the same
+  // transform as its position. It has to be the same one: size against any
+  // other depth and a point can read huge while being drawn in a distant
+  // clump. That is not hypothetical; it shipped. Sizing ran a second
+  // transform against the frame's own bound so that the auto-zoom-off
+  // framing could not affect it, which is precisely backwards — with auto
+  // zoom off the two transforms differ by the ratio of the held span to the
+  // frame's own, so at the dense start the drawn cloud was a small far
+  // clump while the sizing transform had spread the same points across the
+  // whole world box, some of them onto the camera. Those points' 1/w blew
+  // up and the canvas filled with colour. A point clumped on screen is
+  // genuinely clumped; drawing it small is right.
+  //
+  // Clamping the depth rather than the size handles both ends of that in one
+  // expression: it caps growth at MAX_GROW×, and it disposes of w <= 0 for
+  // points behind the camera (Orbit's minDistance lets the camera inside the
+  // cloud), which would otherwise invert the quad. The natural in-cloud
+  // variation at the default framing is only about 0.73x–1.6x, so a cap of 4
+  // is well clear of it and bites only once the camera has dollied in among
+  // the points — which is exactly when the runaway used to start.
+  const REF_DIST = ${refDist};
+  const MAX_GROW = 4.0;
+  let pxAtDepth = V.radius * REF_DIST / max(clip.w, REF_DIST / MAX_GROW);
+  let drawPx = max(pxAtDepth, 1.0);
+  // Below one device pixel there is nothing left to shrink, so the shortfall
+  // is spent as opacity instead of a floor that would make near and far
+  // points read as the same size — same trick as the reference's vFade.
+  let fade = clamp(pxAtDepth, 0.0, 1.0);
+  let r = vec2<f32>(2.0 * drawPx / V.res.x, 2.0 * drawPx / V.res.y);
+  ` : `
   let r = vec2<f32>(2.0 * V.radius / V.res.x, 2.0 * V.radius / V.res.y);
-  // Times clip.w so the perspective divide cancels: a point keeps a constant
-  // pixel size at any camera distance, so zooming resolves a cluster rather
-  // than magnifying it.
+  `}
+  // Times clip.w so the perspective divide cancels: in 2D that keeps a point
+  // a constant pixel size at any camera distance, so zooming resolves a
+  // cluster rather than magnifying it. In 3D, drawPx above already carries
+  // the desired depth falloff, and this cancellation is still needed for the
+  // same reason — the GPU always divides clip.xy by clip.w on rasterization,
+  // so any offset meant to land at a specific *post-divide* size has to be
+  // pre-multiplied by clip.w regardless of how that size was computed.
   clip = vec4<f32>(clip.xy + c * r * clip.w, clip.zw);
 
   var out : VSOut;
   out.clip = clip;
   out.col  = PALETTE[min(lab, 9u)];
   out.uv   = c;
+  ${d === 3 ? "out.fade = fade;" : ""}
   return out;
 }
 
@@ -142,11 +187,22 @@ fn vs(
 // The cost is a hard edge — the smoothstep feather cannot survive, since a
 // feathered edge is exactly a semi-transparent fragment — and a dense cloud
 // that stops accumulating opacity. Which is why this is a toggle.
+//
+// In 3D, in.fade (see vs above) also scales alpha here, including in the
+// occluded branch — so a sub-1px-at-this-depth point still writes depth as
+// the "solid disc" comment above describes, just faintly. That is the same
+// tradeoff occlusion already accepts, now varying with size instead of
+// constant; worth eyeballing the two together, not a reason to gate this on.
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let d = length(in.uv);
   if (d > 1.0) { discard; }
+  ${d === 3 ? `
+  if (V.occlude > 0.5) { return vec4<f32>(in.col, in.fade); }
+  return vec4<f32>(in.col, (1.0 - smoothstep(0.7, 1.0, d)) * 0.85 * in.fade);
+  ` : `
   if (V.occlude > 0.5) { return vec4<f32>(in.col, 1.0); }
   return vec4<f32>(in.col, (1.0 - smoothstep(0.7, 1.0, d)) * 0.85);
+  `}
 }
 `;
