@@ -958,7 +958,7 @@ const view = {
   // with them — at 1 a digit is exactly the point's own size.
   digitScale: 1,
   // Which of thumbColor's three looks. Live, like everything else here.
-  digitStyle: 2 as DigitStyle,
+  digitStyle: 0 as DigitStyle,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
