@@ -48,7 +48,7 @@ Tweakpane (one of three runtime dependencies, the others being DruidJS and ogl) 
 
 ### 2D or 3D (`components`)
 
-One dropdown in the `dimensional reduction` folder, seeded from `?dims=3`, defaulting to 2 and read at the top of `go()` like everything else in that folder. It reaches four places: the library's `nComponents`, druid's `d`, the generated render shader, and the camera's mode.
+One dropdown in the `dimensional reduction` folder, seeded from `?dims=2`, defaulting to 3 and read at the top of `go()` like everything else in that folder. It reaches four places: the library's `nComponents`, druid's `d`, the generated render shader, and the camera's mode.
 
 **The 2D path is bit-identical to what predates it**, which is the property `npm run check:ab` exists to hold — it prints 0 on both variants across the whole of this work. `nComponents` defaults to 2 everywhere and the generated code at d=2 is character-for-character what was written by hand.
 
@@ -63,7 +63,7 @@ Both render pipelines share **one explicit `GPUBindGroupLayout`**. This is not t
 
 ### Digit thumbnails (`main.ts`, `shaders.ts`)
 
-A share of points — the view folder's `digit %`, 1 by default — draw their actual 28×28 MNIST bitmap instead of a disc, so a cluster boundary can be read as digits rather than as colours. Three looks, picked live from `digit style`: **coloured stroke** (strokes take the label colour, black background transparent — sits in the cloud the way a point does), **white on colour** (a solid label-coloured tile with the digit painted white through it) and **black on colour** (the same tile with the strokes knocked out). The style is a uniform, not a per-point property: it costs nothing to store or change, and choosing per point — which a coinflip did while the first two were being tried — means never seeing either alone.
+A share of points — the view folder's `digit %`, all of them by default — draw their actual 28×28 MNIST bitmap instead of a disc, so a cluster boundary can be read as digits rather than as colours. Three looks, picked live from `digit style`: **coloured stroke** (strokes take the label colour, black background transparent — sits in the cloud the way a point does), **white on colour** (a solid label-coloured tile with the digit painted white through it) and **black on colour** (the same tile with the strokes knocked out). The style is a uniform, not a per-point property: it costs nothing to store or change, and choosing per point — which a coinflip did while the first two were being tried — means never seeing either alone.
 
 Five things carry it:
 
@@ -108,7 +108,7 @@ One gap, from Orbit rather than from choice: in 2D, one-finger touch drag does n
 
 The timeline scrubber replays banked frames, so it holds the same invariant as the live path: nothing is read back. During the run each captured iteration is copied into a slot of one big `posHistory` buffer (`VERTEX | COPY_DST`), and the bounds reduce for that iteration is copied into `boundsHistory` alongside it — replay is then two `copyBufferToBuffer` calls and a render pass, with no compute and no `mapAsync`. Banking the bounds rather than recomputing them on scrub is what makes a replayed frame framed exactly as it was live.
 
-The view folder's **`auto zoom`** decides which banked bound a frame is drawn against. On (the default, and the behaviour that predates the checkbox) each slot is framed by its own; off, every slot is framed by the *last* slot's, so the camera stops cancelling out the motion it is filming — points visibly travel instead of the box growing with them. Off is one changed source offset on the same copy, so it costs nothing and needs no shader. Its one deliberate cost: an intermediate frame wider than the final one gets clipped. The embedding expands over a run in practice, and holding a stable frame is the whole point, so that trade is taken rather than papered over with a union.
+The view folder's **`auto zoom`** decides which banked bound a frame is drawn against. On (the behaviour that predates the checkbox) each slot is framed by its own; off (now the default), every slot is framed by the *last* slot's, so the camera stops cancelling out the motion it is filming — points visibly travel instead of the box growing with them. Off is one changed source offset on the same copy, so it costs nothing and needs no shader. Its one deliberate cost: an intermediate frame wider than the final one gets clipped. The embedding expands over a run in practice, and holding a stable frame is the whole point, so that trade is taken rather than papered over with a union.
 
 During a live run the final bound does not exist yet, so the previous run's is used, carried in `sessionStorage` under `pacmap:lastBounds` and read back — 16 bytes, once, after the loop — from the last banked slot. That readback is not the thing the invariant forbids; positions still never leave GPU memory, and nothing is mapped per frame. Each run overwrites rather than unions, so a 2k run after a 65k one is not stuck with a view sized for the big one. With nothing stored (first run of a session) the live pass simply behaves as auto zoom and the held frame takes over at playback.
 

@@ -37,7 +37,7 @@ const status = (m: string) => (statusEl.textContent = m);
 //   ?algo=localmap          run LocalMAP rather than PaCMAP (default pacmap)
 //   ?algo=pacmap-cpu        run DruidJS on the CPU rather than our WGSL
 //   ?knn=gpu|nnd            pick the kNN backend (default cpu brute force)
-//   ?dims=3                 embed and render in 3D (default 2)
+//   ?dims=2                 embed and render in 2D (default 3)
 //   ?knncheck=1             run every backend over one input and report how they compare
 // ---------------------------------------------------------------------------
 
@@ -84,7 +84,7 @@ const ALGO_MODE: AlgoKey =
   : ALGO_PARAM === "localmap" ? "localmap-gpu"
   : "pacmap-gpu";
 const KNN_CHECK = qs.get("knncheck") === "1";
-const DIMS_MODE: Components = qs.get("dims") === "3" ? 3 : 2;
+const DIMS_MODE: Components = qs.get("dims") === "2" ? 2 : 3;
 
 // Playback history. Every captured frame is a full N x d f32 snapshot kept in
 // GPU memory, so the scrubber never reads positions back to the host — same
@@ -949,17 +949,16 @@ function frame(): Promise<void> {
 // the only sensible thing to draw when every point is coplanar.
 const view = {
   pointSize: 1.8,
-  autoZoom: true,
+  autoZoom: false,
   occlusion: true,
   // What share of points draw as their own bitmap. Live, because the atlas
   // holds every digit and this only moves a threshold; 0 is no digits at all.
-  digitPct: 1,
-  // A digit at the point size would be a few pixels across — a smudge, not a
-  // glyph — so thumbnails get their own multiplier rather than dragging the
-  // whole cloud up with them.
-  digitScale: 8,
+  digitPct: 100,
+  // Digits get their own multiplier rather than dragging the whole cloud up
+  // with them — at 1 a digit is exactly the point's own size.
+  digitScale: 1,
   // Which of thumbColor's three looks. Live, like everything else here.
-  digitStyle: 0 as DigitStyle,
+  digitStyle: 2 as DigitStyle,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
