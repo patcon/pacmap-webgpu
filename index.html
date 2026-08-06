@@ -89,7 +89,11 @@
   </div>
   <div id="transport">
     <button id="play" title="Play/pause (space)" disabled>▶</button>
-    <input type="range" id="scrub" min="0" max="0" value="0" step="1" disabled />
+    <!-- step="any" rather than 1: the playhead is fractional and the fraction
+         is what the vertex stage mixes on, so a quantized slider would pin
+         every dragged position to a keyframe and hide the interpolation
+         entirely. Whole-keyframe stepping is still on the arrow keys. -->
+    <input type="range" id="scrub" min="0" max="0" value="0" step="any" disabled />
     <span id="readout">—</span>
   </div>
   <footer>

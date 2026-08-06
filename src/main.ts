@@ -1489,8 +1489,14 @@ scrub.addEventListener("input", () => {
 
 window.addEventListener("keydown", (e) => {
   const tag = (e.target as HTMLElement | null)?.tagName;
-  // Sliders and buttons already handle these keys themselves.
-  if (tag === "SELECT" || tag === "INPUT" || tag === "BUTTON") return;
+  // Sliders and buttons already handle these keys themselves — except the
+  // scrubber, which since step="any" no longer steps by a keyframe under the
+  // browser's own arrow handling but by 1% of the range. Whole keyframes are
+  // what an arrow key should mean, so this handler takes it back once the
+  // scrubber has focus (which one click on it is enough to do).
+  if (e.target !== scrub && (tag === "SELECT" || tag === "INPUT" || tag === "BUTTON")) {
+    return;
+  }
   const step = e.shiftKey ? 10 : 1;
   if (e.code === "Space") {
     e.preventDefault();
