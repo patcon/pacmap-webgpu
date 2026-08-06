@@ -1,5 +1,7 @@
 # PaCMAP and LocalMAP on WebGPU — MNIST demo
 
+https://github.com/user-attachments/assets/109fd4bd-dd54-4e50-b2e8-6f7993794ac1
+
 ```
 npm install
 npm run dev
