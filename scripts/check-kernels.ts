@@ -646,6 +646,123 @@ async function checkEndToEnd(device: GPUDevice): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// The pair graph a consumer draws
+// ---------------------------------------------------------------------------
+
+/**
+ * `PacmapRun.graph` has never had a behaviour check. `nbFwd` and `fpFwd` were
+ * used by the resample but never examined as *data*, and `mnFwd` is new — so
+ * this is a gap being closed rather than ceremony around an addition.
+ *
+ * What is checked here is structure and *kind*: that each array has the shape
+ * it claims, that no entry is out of range or self-referential, and that the
+ * three sets sit at the distances their names imply. The oracle for that last
+ * one is the input matrix itself, recomputed here — it shares no code with
+ * `samplePairs`.
+ *
+ * What is deliberately *not* checked is that `mnFwd` carries the second-closest
+ * of the six candidates rather than the closest. That is held by construction:
+ * the mid-near loop writes one local into both `mnFwd` and the CSR triple, so
+ * there are no two things left to disagree. A check here would only be able to
+ * separate "second of six" from "first of six" statistically, which is a
+ * tolerance to tune rather than an invariant to assert.
+ */
+async function checkGraph(device: GPUDevice): Promise<void> {
+  const X = blobs();
+  const pm = await pacmapWebGPU(device, X, E2E_N, E2E_D, {
+    seed: 7,
+    knn: "cpu",
+  });
+  const { nbFwd, mnFwd, fpFwd, nNB, nMN, nFP } = pm.graph;
+  pm.destroy();
+
+  const kinds = [
+    ["nb", nbFwd, nNB],
+    ["mn", mnFwd, nMN],
+    ["fp", fpFwd, nFP],
+  ] as const;
+
+  for (const [tag, arr, width] of kinds) {
+    check(
+      `graph/${tag}-length`,
+      arr.length === E2E_N * width,
+      `got ${arr.length}, want ${E2E_N * width}`
+    );
+    // `nbFwd` pads short rows with N, which is possible only when kCand < nNB
+    // — i.e. at a handful of points. At this size there should be none, so a
+    // stray N here means a row was never filled rather than legitimately short.
+    check(`graph/${tag}-in-range`, arr.every((v) => v < E2E_N));
+    let self = 0;
+    for (let i = 0; i < E2E_N; i++) {
+      for (let k = 0; k < width; k++) if (arr[i * width + k] === i) self++;
+    }
+    check(`graph/${tag}-no-self-pairs`, self === 0, `${self} of them`);
+  }
+
+  // Near partners are drawn from a kNN result, so a repeat inside one row means
+  // the candidate list or the re-rank collapsed.
+  let dupRows = 0;
+  for (let i = 0; i < E2E_N; i++) {
+    const row = nbFwd.subarray(i * nNB, (i + 1) * nNB);
+    if (new Set(row).size !== nNB) dupRows++;
+  }
+  check("graph/nb-rows-are-duplicate-free", dupRows === 0, `${dupRows} rows`);
+
+  // The further draw rejects the point's own near partners, which is what keeps
+  // a repulsive pair from landing on top of an attractive one.
+  let overlap = 0;
+  for (let i = 0; i < E2E_N; i++) {
+    const near = new Set(nbFwd.subarray(i * nNB, (i + 1) * nNB));
+    for (let f = 0; f < nFP; f++) if (near.has(fpFwd[i * nFP + f])) overlap++;
+  }
+  check("graph/fp-avoids-near-partners", overlap === 0, `${overlap} of them`);
+
+  // The checks that say these are the *right* three sets and not three copies
+  // of one draw.
+  //
+  // In **rank** space, not distance space. Distance was tried first and is too
+  // blunt to keep: at D=16 the pairwise distances concentrate, so mean |d| comes
+  // out 4.58 / 19.79 / 20.49 and the mid-near-vs-further gap is 3% — a `mnFwd`
+  // wired to a uniform draw passes an ordering test on those numbers, which was
+  // demonstrated rather than feared. A rank quantile ("what fraction of all
+  // points are closer to i than this partner is") does not concentrate, and the
+  // three sets are built to land at very different ones: near is the top nNB of
+  // N, so ~0; mid-near is the second-closest of six uniform draws, so ~2/7;
+  // further is uniform, so ~1/2.
+  //
+  // That makes the mid-near band the sharp one — it is bounded on *both* sides,
+  // and the interesting mistake is exactly what the upper bound catches.
+  const rankQuantile = (arr: Uint32Array, width: number) => {
+    const dj = new Float64Array(E2E_N);
+    let s = 0;
+    for (let i = 0; i < E2E_N; i++) {
+      for (let j = 0; j < E2E_N; j++) {
+        let dd = 0;
+        for (let c = 0; c < E2E_D; c++) {
+          const t = X[i * E2E_D + c] - X[j * E2E_D + c];
+          dd += t * t;
+        }
+        dj[j] = dd;
+      }
+      for (let k = 0; k < width; k++) {
+        const d = dj[arr[i * width + k]];
+        let closer = 0;
+        for (let j = 0; j < E2E_N; j++) if (dj[j] < d) closer++;
+        s += closer / E2E_N;
+      }
+    }
+    return s / (E2E_N * width);
+  };
+  const [qNB, qMN, qFP] = kinds.map(([, arr, width]) =>
+    rankQuantile(arr, width)
+  );
+  const seen = `${qNB.toFixed(3)} / ${qMN.toFixed(3)} / ${qFP.toFixed(3)}`;
+  check("graph/nb-rank-is-nearest", qNB < 0.05, seen);
+  check("graph/mn-rank-is-mid", qMN > 0.15 && qMN < 0.42, seen);
+  check("graph/fp-rank-is-uniform", qFP > 0.45, seen);
+}
+
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<number> {
   const session = await openDawn();
@@ -664,6 +781,7 @@ async function main(): Promise<number> {
     await checkResample(session.device, 3);
     await checkBounds(session.device);
     await checkEndToEnd(session.device);
+    await checkGraph(session.device);
   } finally {
     session.close();
   }

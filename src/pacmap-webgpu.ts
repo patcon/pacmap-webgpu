@@ -974,6 +974,14 @@ interface Pairs {
    */
   nbFwd: Uint32Array;
   /**
+   * N x nMN, row-major: i's own mid-near partners. Unlike the other two this is
+   * needed by nothing in the optimizer — mid-near reaches the gradient purely
+   * through the CSR. It exists so the three pair kinds can be handed to a
+   * consumer symmetrically (see `PairGraph`), and the mid-near loop writes it
+   * and the CSR triple from one variable so the two cannot disagree.
+   */
+  mnFwd: Uint32Array;
+  /**
    * N x nFP, row-major: i's own further partners. Held outside the CSR because
    * LocalMAP redraws it mid-run; under PaCMAP it simply never changes.
    */
@@ -1022,6 +1030,7 @@ function samplePairs(
   const pj = new Uint32Array(total);
   const pt = new Uint8Array(total);
   const nbFwd = new Uint32Array(N * nNB).fill(N);
+  const mnFwd = new Uint32Array(N * nMN);
   const fpFwd = new Uint32Array(N * nFP);
   let w = 0;
 
@@ -1073,8 +1082,13 @@ function samplePairs(
           second = c;
         }
       }
+      // One variable into both destinations. `mnFwd` is not a second reading of
+      // the draw — it is the same pick the CSR gets, so no check has to hold
+      // them in agreement.
+      const j = second >= 0 ? second : best;
+      mnFwd[i * nMN + m] = j;
       pi[w] = i;
-      pj[w] = second >= 0 ? second : best;
+      pj[w] = j;
       pt[w] = T_MN;
       w++;
     }
@@ -1095,6 +1109,7 @@ function samplePairs(
     j: pj.subarray(0, w),
     t: pt.subarray(0, w),
     nbFwd,
+    mnFwd,
     fpFwd,
   };
 }
@@ -1558,6 +1573,42 @@ fn adam_main(@builtin(global_invocation_id) gid : vec3<u32>) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The three pair sets, dense and row-major, for a consumer that wants to *draw*
+ * the graph rather than just its result.
+ *
+ * Every pair here is a pair that acts. Checked against upstream rather than
+ * assumed: `pacmap_grad` walks the whole of `pair_neighbors`, `pair_MN` and
+ * `pair_FP` on every call, and there is no per-iteration subsampling anywhere in
+ * the optimizer. The subsetting happens once, at sampling time — `sample_MN_pair`
+ * draws six candidates per slot and keeps the second-closest, and the five losers
+ * are never stored. So these are the force set exactly, not a superset of it.
+ *
+ * What that does *not* mean is that every pair is pulling at every iteration.
+ * `weightsAt` sends `w_MN` to 0 for the whole of phase 3 — the last 250 of 450
+ * iterations at the default phases — so the mid-near pairs sit inert for most of
+ * a run while still existing. A consumer drawing them should say so.
+ */
+export interface PairGraph {
+  /** N x nNB. Row `i` is `i`'s own near partners. */
+  nbFwd: Uint32Array;
+  /** N x nMN. Row `i` is `i`'s own mid-near partners. */
+  mnFwd: Uint32Array;
+  /**
+   * N x nFP. Row `i` is `i`'s own further partners **as first drawn**.
+   *
+   * Under `variant: "localmap"` this is not the live set: the resample redraws
+   * the further pairs on the GPU 24 times during phase 3, and those redraws land
+   * in device memory without ever coming back here. Drawing this array under
+   * LocalMAP therefore shows the initial pairs for the whole run.
+   */
+  fpFwd: Uint32Array;
+  /** Row widths, so a consumer needn't re-derive them from the ratios. */
+  nNB: number;
+  nMN: number;
+  nFP: number;
+}
+
+/**
  * What a consumer needs to drive an embedding to completion and draw it.
  *
  * The surface `main.ts` binds its renderer, bounds reduce and playback history
@@ -1574,6 +1625,13 @@ export interface EmbeddingRun {
    * than from this buffer.
    */
   positions: GPUBuffer;
+  /**
+   * The pair graph, for a consumer that draws it. Optional because not every
+   * implementation of this surface has one to give — DruidJS builds its own
+   * neighbour graph internally and exposes nothing, so `druid-cpu.ts` leaves
+   * this undefined and a consumer should treat its absence as "no overlay".
+   */
+  graph?: PairGraph;
   run(): void | Promise<void>;
   runRange(from: number, to: number): void | Promise<void>;
   read(): Promise<Float32Array>;
@@ -1582,6 +1640,8 @@ export interface EmbeddingRun {
 }
 
 export interface PacmapRun extends EmbeddingRun {
+  /** Always present on this path — the pairs are sampled here. */
+  graph: PairGraph;
   /** Encode and submit the full optimization. No host round-trip inside. */
   run(): void;
   /** Encode iterations [from, to) only — for stepping an animation. */
@@ -1868,6 +1928,16 @@ export async function pacmapWebGPU(
 
   return {
     positions: yBuf,
+    // Handed out, not copied. These are setup-time CPU arrays and nothing here
+    // reads them again, so a consumer holding them costs nothing extra — note
+    // `nbFwd` is also what the LocalMAP resample's reject list is built from,
+    // so it must not be mutated.
+    graph: {
+      nbFwd: pairs.nbFwd,
+      mnFwd: pairs.mnFwd,
+      fpFwd: pairs.fpFwd,
+      nNB, nMN, nFP,
+    },
     totalIters,
     run: () => runRange(0, totalIters),
     runRange,
