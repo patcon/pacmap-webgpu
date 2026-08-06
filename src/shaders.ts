@@ -60,8 +60,8 @@ export const renderWGSL = (d = 2, refDist = 2.414213562373095) => /* wgsl */ `
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
 // instead of a layout that changes with a dropdown.
 struct Bounds { lo : vec4<f32>, hi : vec4<f32> };
-// 88 bytes, padded to 96 by the mat4's 16-byte alignment: mat4 64 + vec2 8 +
-// f32 x 4. viewProj already carries the WebGL-to-WebGPU depth remap (see
+// 92 bytes, padded to 96 by the mat4's 16-byte alignment: mat4 64 + vec2 8 +
+// f32 x 5. viewProj already carries the WebGL-to-WebGPU depth remap (see
 // resize() in main.ts), so it is used as-is. occlude took the slot that used to
 // be padding — see the fragment.
 struct View {
@@ -74,6 +74,8 @@ struct View {
   // so the shader needs no N.
   digitCount : f32,
   digitScale : f32,
+  // Which of the three thumbnail looks — see thumbColor.
+  digitStyle : f32,
 };
 
 @group(0) @binding(0) var<uniform> B : Bounds;
@@ -105,7 +107,7 @@ struct VSOut {
   @builtin(position) clip : vec4<f32>,
   @location(0)       col  : vec3<f32>,
   @location(1)       uv   : vec2<f32>,
-  // Tile index in the low 31 bits, style in the top bit — see the fragment.
+  // The tile to draw, or NO_THUMB for an ordinary disc.
   @location(3) @interpolate(flat) thumb : u32,
   ${d === 3 ? "@location(2)       fade : f32," : ""}
 };
@@ -144,7 +146,7 @@ fn vs(
   // permutation fixed at setup — so the slider adds and removes them spread
   // through the cloud, and moving it costs one number in this uniform rather
   // than a rebuilt buffer.
-  let isThumb = f32(thm & 0x7FFFFFFFu) < V.digitCount;
+  let isThumb = f32(thm) < V.digitCount;
   let sizeMul = select(1.0, V.digitScale, isThumb);
 
   // Data → world. One scale for every axis so the embedding isn't stretched,
@@ -227,8 +229,8 @@ fn vs(
   out.clip = clip;
   out.col  = PALETTE[min(lab, 9u)];
   out.uv   = c;
-  // The tile is this point's own bitmap; only the style bit rides along.
-  out.thumb = select(NO_THUMB, ii | (thm & 0x80000000u), isThumb);
+  // The tile is this point's own bitmap, so the attribute carries only rank.
+  out.thumb = select(NO_THUMB, ii, isThumb);
   ${d === 3 ? "out.fade = fade;" : ""}
   return out;
 }
@@ -258,15 +260,22 @@ fn vs(
 // tradeoff occlusion already accepts, now varying with size instead of
 // constant; worth eyeballing the two together, not a reason to gate this on.
 
-// A sampled 1% of points draw their actual 28x28 MNIST bitmap instead of a
-// disc, so a cluster boundary can be read as digits rather than as colours.
-// Two styles, one bit apart, because which one reads better in a dense cloud is
-// an open question and each selected point flips a coin between them:
+// A share of points draw their actual 28x28 MNIST bitmap instead of a disc, so
+// a cluster boundary can be read as digits rather than as colours. Three styles,
+// picked live from the pane, because which reads best in a dense cloud depends
+// on how dense it is:
 //
-//   ink      — the strokes take the label colour and the black background is
-//              transparent, so the tile sits in the cloud the way a point does.
-//   inverted — a solid label-coloured tile with the digit painted white through
-//              it, which reads at smaller sizes but occludes what is behind.
+//   0 coloured stroke — the strokes take the label colour and the black
+//     background is transparent, so the tile sits in the cloud the way a point
+//     does. Loses definition where clusters overlap.
+//   1 white on colour — a solid label-coloured tile with the digit painted
+//     white through it. Reads at smaller sizes, but occludes what is behind.
+//   2 black on colour — the same tile with the strokes knocked out to black,
+//     which keeps the label colour dominant at a distance.
+//
+// A uniform and not a per-point bit: the style costs nothing to store and
+// nothing to change, and picking it per point (as a coinflip did while both
+// were being tried) means never seeing either one alone.
 fn texel(base : u32, x : i32, y : i32) -> f32 {
   let cx = u32(clamp(x, 0, i32(TILE_PX) - 1));
   let cy = u32(clamp(y, 0, i32(TILE_PX) - 1));
@@ -276,7 +285,7 @@ fn texel(base : u32, x : i32, y : i32) -> f32 {
 }
 
 fn thumbColor(thumb : u32, uv : vec2<f32>, col : vec3<f32>) -> vec4<f32> {
-  let base = (thumb & 0x7FFFFFFFu) * TILE_WORDS;
+  let base = thumb * TILE_WORDS;
   // Quad space is [-1, 1] with y up; the sprite's row 0 is the top of the
   // digit, so v is flipped here and the digits come out upright.
   let g = vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
@@ -292,7 +301,8 @@ fn thumbColor(thumb : u32, uv : vec2<f32>, col : vec3<f32>) -> vec4<f32> {
     mix(texel(base, x, y),     texel(base, x + 1, y),     f.x),
     mix(texel(base, x, y + 1), texel(base, x + 1, y + 1), f.x),
     f.y);
-  if ((thumb >> 31u) == 1u) { return vec4<f32>(mix(col, vec3<f32>(1.0), v), 1.0); }
+  if (V.digitStyle > 1.5) { return vec4<f32>(col * (1.0 - v), 1.0); }
+  if (V.digitStyle > 0.5) { return vec4<f32>(mix(col, vec3<f32>(1.0), v), 1.0); }
   return vec4<f32>(col, v);
 }
 

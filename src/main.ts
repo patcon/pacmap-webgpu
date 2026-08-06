@@ -144,6 +144,20 @@ const PALETTE: [number, number, number][] = [
 /** u32 words per 28x28 tile, four 8-bit intensities to the word. */
 const TILE_WORDS = IMAGE_SIZE / 4;
 
+/** Which of `thumbColor`'s looks a digit is drawn in. */
+type DigitStyle = 0 | 1 | 2;
+/**
+ * Annotated rather than inferred, for the reason the algorithm map is: Tweakpane
+ * types `options` values as whatever they look like, so a fourth entry pointing
+ * at a style the shader does not implement would type-check and then draw the
+ * default.
+ */
+const DIGIT_STYLES: Record<string, DigitStyle> = {
+  "coloured stroke": 0,
+  "white on colour": 1,
+  "black on colour": 2,
+};
+
 /**
  * Pack every digit into one atlas, and give every point a rank deciding how
  * early it becomes a thumbnail.
@@ -156,14 +170,10 @@ const TILE_WORDS = IMAGE_SIZE / 4;
  * 128MB default limit on a storage binding. The tile index is then just the
  * point index, so nothing has to map one to the other.
  *
- * The per-instance `thumb` attribute carries the rank in the low 31 bits and
- * the style coinflip in the top one. One attribute rather than two because they
- * are read together and can never be meaningful apart.
- *
- * Rank is a random permutation, so raising the slider adds digits spread
- * through the cloud rather than walking along the sample order. Both it and the
- * coinflip come from the run's seed: two runs at one seed show the same digits
- * in the same styles, or comparing them would also be comparing two samples.
+ * Rank is a random permutation drawn from the run's seed, so raising the slider
+ * adds digits spread through the cloud rather than walking along the point
+ * order, and two runs at one seed show the same digits. Which *look* they are
+ * drawn in is a uniform, not stored here — see `thumbColor` in shaders.ts.
  *
  * Must be called *before* `pcaProject`, which runs with `inPlace: true` and
  * overwrites X. Reading it afterwards yields plausible noise rather than an
@@ -182,11 +192,9 @@ function buildDigitAtlas(X: Float32Array, N: number, seed: number) {
     rank[j] = t;
   }
 
-  const thumbs = new Uint32Array(N);
   // At least one tile: a zero-length storage buffer is not a legal binding.
   const atlas = new Uint32Array(Math.max(1, N) * TILE_WORDS);
   for (let i = 0; i < N; i++) {
-    thumbs[i] = (rank[i] | (rand() < 0.5 ? 0 : 0x80000000)) >>> 0;
     const src = i * IMAGE_SIZE;
     const dst = i * TILE_WORDS;
     for (let w = 0; w < TILE_WORDS; w++) {
@@ -199,7 +207,7 @@ function buildDigitAtlas(X: Float32Array, N: number, seed: number) {
     }
   }
 
-  return { thumbs, atlas };
+  return { thumbs: rank, atlas };
 }
 
 /** Duplicated from pca.ts / pacmap-webgpu.ts, which keep it module-private so
@@ -578,6 +586,7 @@ async function go() {
       // resolution against N happens here rather than needing N in the shader.
       m[20] = (view.digitPct / 100) * N;
       m[21] = view.digitScale;
+      m[22] = view.digitStyle;
       device.queue.writeBuffer(viewUniform, 0, m);
 
       // Sized with the canvas, and only in 3D. Recreated rather than resized —
@@ -949,6 +958,8 @@ const view = {
   // glyph — so thumbnails get their own multiplier rather than dragging the
   // whole cloud up with them.
   digitScale: 8,
+  // Which of thumbColor's three looks. Live, like everything else here.
+  digitStyle: 0 as DigitStyle,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
@@ -1172,6 +1183,12 @@ viewFolder
     min: 1,
     max: 20,
     step: 0.5,
+  })
+  .on("change", () => onViewChange?.());
+viewFolder
+  .addBinding(view, "digitStyle", {
+    label: "digit style",
+    options: DIGIT_STYLES,
   })
   .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.
