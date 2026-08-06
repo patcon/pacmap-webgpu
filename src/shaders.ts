@@ -60,10 +60,10 @@ export const renderWGSL = (d = 2, refDist = 2.414213562373095) => /* wgsl */ `
 // history slot stride and one sessionStorage schema across the 2D/3D switch,
 // instead of a layout that changes with a dropdown.
 struct Bounds { lo : vec4<f32>, hi : vec4<f32> };
-// 92 bytes, padded to 96 by the mat4's 16-byte alignment: mat4 64 + vec2 8 +
-// f32 x 5. viewProj already carries the WebGL-to-WebGPU depth remap (see
-// resize() in main.ts), so it is used as-is. occlude took the slot that used to
-// be padding — see the fragment.
+// Exactly 96 bytes: mat4 64 + vec2 8 + f32 x 6. It used to be 92 padded to 96
+// by the mat4's 16-byte alignment; lerpT took the padding, as occlude took the
+// slot before it. viewProj already carries the WebGL-to-WebGPU depth remap (see
+// resize() in main.ts), so it is used as-is.
 struct View {
   viewProj   : mat4x4<f32>,
   res        : vec2<f32>,
@@ -76,9 +76,19 @@ struct View {
   digitScale : f32,
   // Which of the three thumbnail looks — see thumbColor.
   digitStyle : f32,
+  // Where between the two bound keyframes this frame sits. Playback binds
+  // adjacent history slots to @location(0) and @location(3) and the vertex
+  // stage mixes them; 0 draws keyframe A exactly, which is what the live path
+  // and an unticked "interpolation" both leave it at.
+  lerpT      : f32,
 };
 
-@group(0) @binding(0) var<uniform> B : Bounds;
+// A and B: the two keyframes being mixed. Two 32-byte bindings rather than one
+// 64-byte struct, so BOUNDS_BYTES keeps meaning both the history slot stride
+// and a uniform's size — the staging buffer and the sessionStorage schema are
+// written against that one constant. Both hold the same box on the live path.
+@group(0) @binding(0) var<uniform> B  : Bounds;
+@group(0) @binding(3) var<uniform> B2 : Bounds;
 @group(0) @binding(1) var<uniform> V : View;
 // The digit atlas: every point's 28x28 bitmap, tile-major, four 8-bit
 // intensities to the u32. Quantized because holding *all* of them is what makes
@@ -129,6 +139,10 @@ fn vs(
   @location(0)             p   : vec${d}<f32>,
   @location(1)             lab : u32,
   @location(2)             thm : u32,
+  // The next keyframe, bound from the same history buffer one slot along. A
+  // vertex input location, which is a separate namespace from VSOut's — the 3
+  // it shares with the thumb interpolant is not a collision.
+  @location(3)             pB  : vec${d}<f32>,
 ) -> VSOut {
   var corners = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
@@ -155,12 +169,23 @@ fn vs(
   // user moves it. In 2D the box's z extent is exactly 0, so one span
   // expression serves both — measured, a 3D layout comes out near-isotropic
   // (per-axis spreads within 3% of each other), so one span frames it well.
-  let ctr  = (B.lo.xyz + B.hi.xyz) * 0.5;
-  let ext  = B.hi.xyz - B.lo.xyz;
+  //
+  // The box is mixed on the same t as the position. Under "auto zoom" each
+  // keyframe is framed by its own banked bound, so a snapping box under gliding
+  // points would pulse once per keyframe; held, both bindings carry the same
+  // box and the mix is a no-op.
+  let lo   = mix(B.lo, B2.lo, V.lerpT);
+  let hi   = mix(B.hi, B2.hi, V.lerpT);
+  let ctr  = (lo.xyz + hi.xyz) * 0.5;
+  let ext  = hi.xyz - lo.xyz;
   let span = max(max(max(ext.x, ext.y), ext.z), 1e-6);
+  // Straight lerp between adjacent keyframes — no easing, no spline. At lerpT
+  // 0 this is p exactly, so an unticked "interpolation" draws what predates it
+  // bit for bit.
+  let pos = mix(p, pB, V.lerpT);
   let w = ${d === 3
-    ? "(p - ctr) / (span * 0.55)"
-    : "vec3<f32>((p - ctr.xy) / (span * 0.55), 0.0)"};
+    ? "(pos - ctr) / (span * 0.55)"
+    : "vec3<f32>((pos - ctr.xy) / (span * 0.55), 0.0)"};
   // The projection owns the aspect divide now, so there is none here.
   var clip = V.viewProj * vec4<f32>(w, 1.0);
 

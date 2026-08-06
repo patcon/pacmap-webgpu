@@ -92,7 +92,11 @@ const DIMS_MODE: Components = qs.get("dims") === "2" ? 2 : 3;
 // 780KB in 3D, so the budget, not the iteration count, is what decides how many
 // we keep — and a 3D run banks correspondingly fewer, or strides coarser.
 const HISTORY_BUDGET_BYTES = 128 << 20;
-const PLAYBACK_FPS = 60;
+
+// Byte offset of `lerpT` in the view uniform — the last of the 24 floats. Its
+// own tiny write, because it changes per drawn frame while everything else in
+// that struct only changes when the camera or a pane control does.
+const LERP_T_OFFSET = 92;
 
 // The framing box: `lo.xyzw hi.xyzw`, one size at either dimensionality (see
 // `struct Bounds` in shaders.ts). Every buffer, history slot and copy that
@@ -371,17 +375,28 @@ async function go() {
       size: BOUNDS_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
+    // Two boxes, for the two keyframes an interpolated frame mixes. The live
+    // path writes the same box into both, so `lerpT` cannot affect it whatever
+    // it holds.
     const boundsUniform = device.createBuffer({
       size: BOUNDS_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    // 88 bytes rounded up to the struct's 16-byte alignment: viewProj mat4, res
-    // vec2, radius, occlude, digits, digitScale. See `struct View`.
+    const boundsUniformB = device.createBuffer({
+      size: BOUNDS_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // 96 bytes exactly: viewProj mat4, res vec2, radius, occlude, digitCount,
+    // digitScale, digitStyle, lerpT. See `struct View`.
     const viewUniform = device.createBuffer({
       size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const viewUniformData = new Float32Array(24);
+    // Where the drawn frame sits between the two bound keyframes. Never
+    // anything but 0 on the live path, which binds one keyframe to both slots.
+    let lerpT = 0;
+    const lerpScratch = new Float32Array(1);
 
     // --- Playback history --------------------------------------------------
     // One slot per captured frame, plus slot 0 for the pre-optimization init.
@@ -448,6 +463,12 @@ async function go() {
           visibility: GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
+        {
+          // The second keyframe's box, mixed against binding 0 on `lerpT`.
+          binding: 3,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: "uniform" },
+        },
       ],
     });
     const renderDesc: GPURenderPipelineDescriptor = {
@@ -479,6 +500,21 @@ async function go() {
             arrayStride: 4,
             stepMode: "instance",
             attributes: [{ shaderLocation: 2, offset: 0, format: "uint32" }],
+          },
+          {
+            // The next keyframe. Same shape as slot 0 and, on the playback
+            // path, the same buffer — bound one slot along. Binding one buffer
+            // to two vertex slots at different offsets is legal; vertex buffers
+            // are read-only.
+            arrayStride: 4 * nComponents,
+            stepMode: "instance",
+            attributes: [
+              {
+                shaderLocation: 3,
+                offset: 0,
+                format: `float32x${nComponents}` as GPUVertexFormat,
+              },
+            ],
           },
         ],
       },
@@ -541,6 +577,7 @@ async function go() {
         { binding: 0, resource: { buffer: boundsUniform } },
         { binding: 1, resource: { buffer: viewUniform } },
         { binding: 2, resource: { buffer: atlasBuf } },
+        { binding: 3, resource: { buffer: boundsUniformB } },
       ],
     });
 
@@ -587,6 +624,9 @@ async function go() {
       m[20] = (view.digitPct / 100) * N;
       m[21] = view.digitScale;
       m[22] = view.digitStyle;
+      // Owned by `drawFrame`, which rewrites just these four bytes per frame.
+      // Carried here too so a resize mid-playback cannot stomp it back to 0.
+      m[23] = lerpT;
       device.queue.writeBuffer(viewUniform, 0, m);
 
       // Sized with the canvas, and only in 3D. Recreated rather than resized —
@@ -646,10 +686,18 @@ async function go() {
     };
     requestAnimationFrame(camTick);
 
+    /**
+     * Encode one draw.
+     *
+     * `offsetB` is the keyframe the vertex stage mixes toward on `lerpT`. The
+     * live path passes the same offset twice, which makes the mix a no-op
+     * whatever `lerpT` holds; only playback ever passes two.
+     */
     function encodeRender(
       enc: GPUCommandEncoder,
       posBuf: GPUBuffer,
-      offset: number
+      offset: number,
+      offsetB: number = offset
     ) {
       const occlude = occludingNow() && depthView !== null;
       const rp = enc.beginRenderPass({
@@ -677,6 +725,7 @@ async function go() {
       rp.setVertexBuffer(0, posBuf, offset, frameBytes);
       rp.setVertexBuffer(1, labelBuf);
       rp.setVertexBuffer(2, thumbBuf);
+      rp.setVertexBuffer(3, posBuf, offsetB, frameBytes);
       rp.draw(6, N);
       rp.end();
     }
@@ -699,13 +748,18 @@ async function go() {
         slot * BOUNDS_BYTES,
         BOUNDS_BYTES
       );
+      // Both boxes, always the same one: a live frame has no next keyframe to
+      // interpolate toward, so the mix in the shader has to come out at the box
+      // it was given.
       if (view.autoZoom || !seedBounds) {
         enc.copyBufferToBuffer(boundsStorage, 0, boundsUniform, 0, BOUNDS_BYTES);
+        enc.copyBufferToBuffer(boundsStorage, 0, boundsUniformB, 0, BOUNDS_BYTES);
       } else {
         // Held fixed, but the final frame's bound doesn't exist yet — the
         // previous run's is the only guess there is. Ordered against the submit
         // below on the queue timeline, so writing it here is safe.
         device.queue.writeBuffer(boundsUniform, 0, seedBounds);
+        device.queue.writeBuffer(boundsUniformB, 0, seedBounds);
       }
       enc.copyBufferToBuffer(
         pm.positions,
@@ -719,21 +773,50 @@ async function go() {
       device.queue.submit([enc.finish()]);
     }
 
-    /** Draw a banked frame. No compute, no readback — two copies and a pass. */
-    function drawFrame(slot: number) {
-      // Auto zoom frames each slot to its own extent; held, the whole trace is
-      // framed by the last slot, so the scrubber shows travel rather than a
-      // camera that cancels it out.
-      const boundsSlot = view.autoZoom ? slot : banked - 1;
+    /**
+     * Draw a banked frame. No compute, no readback — copies and a pass.
+     *
+     * `f` is the fractional playhead, not a slot: the two keyframes it sits
+     * between are bound together and mixed in the vertex stage, which is what
+     * makes playback smooth rather than stepped. With `interpolation` off the
+     * fraction is dropped and this is exactly the slot-at-a-time draw that
+     * predates it.
+     */
+    function drawFrame(f: number) {
+      const a = Math.max(0, Math.min(Math.floor(f), banked - 1));
+      // Clamped, so the last frame mixes with itself rather than wrapping to
+      // slot 0 — which matters most for a stopped run, where the trace ends
+      // wherever it ended.
+      const b = Math.min(a + 1, banked - 1);
+      lerpT = view.interpolate ? f - a : 0;
+      // Four bytes, and ordered against the submit below on the queue timeline
+      // like the seedBounds write above. The rest of the struct is rewritten
+      // only when the camera or a pane control moves.
+      lerpScratch[0] = lerpT;
+      device.queue.writeBuffer(viewUniform, LERP_T_OFFSET, lerpScratch);
+
+      // Auto zoom frames each slot to its own extent, so the two keyframes'
+      // boxes differ and get mixed alongside the positions; held, the whole
+      // trace is framed by the last slot, so the scrubber shows travel rather
+      // than a camera that cancels it out — and both bindings get that one box.
+      const slotA = view.autoZoom ? a : banked - 1;
+      const slotB = view.autoZoom ? b : banked - 1;
       const enc = device.createCommandEncoder();
       enc.copyBufferToBuffer(
         boundsHistory,
-        boundsSlot * BOUNDS_BYTES,
+        slotA * BOUNDS_BYTES,
         boundsUniform,
         0,
         BOUNDS_BYTES
       );
-      encodeRender(enc, posHistory, slot * frameBytes);
+      enc.copyBufferToBuffer(
+        boundsHistory,
+        slotB * BOUNDS_BYTES,
+        boundsUniformB,
+        0,
+        BOUNDS_BYTES
+      );
+      encodeRender(enc, posHistory, a * frameBytes, b * frameBytes);
       device.queue.submit([enc.finish()]);
     }
 
@@ -899,7 +982,7 @@ async function go() {
       last = now;
       orbit.update();
       if (playing) {
-        const next = playhead + dt * PLAYBACK_FPS;
+        const next = playhead + dt * view.playbackFps;
         if (next >= banked - 1) {
           onSeek!(banked - 1);
           setPlaying(false);
@@ -908,7 +991,8 @@ async function go() {
         }
       }
       resize();
-      drawFrame(Math.round(playhead));
+      // Fractional, not rounded: the fraction is what `drawFrame` mixes on.
+      drawFrame(playhead);
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -959,6 +1043,15 @@ const view = {
   digitScale: 1,
   // Which of thumbColor's three looks. Live, like everything else here.
   digitStyle: 0 as DigitStyle,
+  // Smoothed playback: adjacent keyframes mixed in the vertex stage rather than
+  // one drawn at a time. Off is the stepped playback that predates it, exactly.
+  interpolate: true,
+  // How many keyframes a second playback advances, which is also what decides
+  // whether there is anything to interpolate: at 60 on a 60Hz panel the cursor
+  // lands on a keyframe every tick and the mix has nothing to fill. 30 gives
+  // two drawn frames per pair there, more on a faster display. Capped at 60,
+  // above which it only skips keyframes.
+  playbackFps: 30,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
@@ -1329,6 +1422,21 @@ viewFolder
   .addBinding(view, "digitStyle", {
     label: "digit style",
     options: DIGIT_STYLES,
+  })
+  .on("change", () => onViewChange?.());
+// Both read by the playback loop, which redraws unconditionally, so like
+// `autoZoom` there is nothing to install — `onViewChange` is here to keep the
+// bindings alike. Neither does anything during a live run: there is no next
+// keyframe to interpolate toward, and the run's own cadence is `iters/frame`.
+viewFolder
+  .addBinding(view, "interpolate", { label: "interpolation" })
+  .on("change", () => onViewChange?.());
+viewFolder
+  .addBinding(view, "playbackFps", {
+    label: "playback fps",
+    min: 1,
+    max: 60,
+    step: 1,
   })
   .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.

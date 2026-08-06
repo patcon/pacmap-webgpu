@@ -216,6 +216,19 @@ const cases: Case[] = [
               stepMode: "instance",
               attributes: [{ shaderLocation: 2, offset: 0, format: "uint32" as const }],
             },
+            {
+              // The playback interpolation's second keyframe — same shape as
+              // slot 0, and in main.ts the same buffer at another offset.
+              arrayStride: 4 * d,
+              stepMode: "instance",
+              attributes: [
+                {
+                  shaderLocation: 3,
+                  offset: 0,
+                  format: `float32x${d}` as GPUVertexFormat,
+                },
+              ],
+            },
           ],
         },
         fragment: {
@@ -299,6 +312,13 @@ const cases: Case[] = [
             visibility: GPUShaderStage.FRAGMENT,
             buffer: { type: "read-only-storage" as const },
           },
+          // The second keyframe's framing box, mixed against binding 0 on the
+          // view uniform's lerpT.
+          {
+            binding: 3,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" as const },
+          },
         ],
       });
       const desc: GPURenderPipelineDescriptor = {
@@ -326,6 +346,13 @@ const cases: Case[] = [
               stepMode: "instance",
               attributes: [
                 { shaderLocation: 2, offset: 0, format: "uint32" as const },
+              ],
+            },
+            {
+              arrayStride: 12,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 3, offset: 0, format: "float32x3" as const },
               ],
             },
           ],
@@ -356,9 +383,10 @@ const cases: Case[] = [
       const bindGroup = device.createBindGroup({
         layout: bgl,
         entries: [
-          { binding: 0, resource: { buffer: uniform(32) } }, // Bounds
+          { binding: 0, resource: { buffer: uniform(32) } }, // Bounds A
           { binding: 1, resource: { buffer: uniform(96) } }, // View
           { binding: 2, resource: { buffer: atlas } }, // one f32 per texel
+          { binding: 3, resource: { buffer: uniform(32) } }, // Bounds B
         ],
       });
       const vbuf = (size: number) =>
@@ -377,6 +405,9 @@ const cases: Case[] = [
         bundle.setVertexBuffer(0, positions);
         bundle.setVertexBuffer(1, labels);
         bundle.setVertexBuffer(2, thumbs);
+        // The same buffer as slot 0, which is exactly what playback does —
+        // one history buffer bound twice at two offsets.
+        bundle.setVertexBuffer(3, positions);
         bundle.draw(6, M);
         bundle.finish();
       }
