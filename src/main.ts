@@ -138,6 +138,80 @@ const PALETTE: [number, number, number][] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Digit thumbnails
+// ---------------------------------------------------------------------------
+
+/** Fraction of points drawn as their actual bitmap rather than as a disc. */
+const THUMB_FRAC = 0.01;
+/** An instance that is not a thumbnail. Matches NO_THUMB in the render shader. */
+const NO_THUMB = 0xffffffff;
+
+/**
+ * Pick a sample of points to draw as digits, and pack their bitmaps into one
+ * tile-major atlas.
+ *
+ * The per-instance `thumb` attribute this returns carries both halves of the
+ * decision: NO_THUMB for an ordinary point, otherwise the tile index in the low
+ * 31 bits and the style coinflip in the top one. One attribute rather than two
+ * because they are read together and can never be meaningful apart.
+ *
+ * The atlas is a plain f32 storage buffer rather than an r8unorm texture — see
+ * the binding in shaders.ts for why. 1% of 65k is 650 tiles, so it costs about
+ * 2MB, which is nothing beside the position history.
+ *
+ * The selection is drawn from the run's seed, so the same seed picks the same
+ * digits and the same styles — otherwise comparing two runs would also be
+ * comparing two different samples.
+ *
+ * Must be called *before* `pcaProject`, which runs with `inPlace: true` and
+ * overwrites X. Reading it afterwards yields plausible noise rather than an
+ * error.
+ */
+function buildDigitThumbs(X: Float32Array, N: number, seed: number) {
+  const rand = mulberry32(seed ^ 0x7d1);
+  const count = Math.min(N, Math.floor(N * THUMB_FRAC));
+
+  // Partial Fisher-Yates: `count` distinct indices without rejection sampling,
+  // which degrades as the sample approaches N.
+  const pool = new Uint32Array(N);
+  for (let i = 0; i < N; i++) pool[i] = i;
+  for (let i = 0; i < count; i++) {
+    const j = i + Math.floor(rand() * (N - i));
+    const t = pool[i];
+    pool[i] = pool[j];
+    pool[j] = t;
+  }
+
+  const thumbs = new Uint32Array(N).fill(NO_THUMB);
+  // At least one tile: a zero-length storage buffer is not a legal binding, and
+  // N below 100 rounds the sample down to none.
+  const atlas = new Float32Array(Math.max(1, count) * IMAGE_SIZE);
+  for (let t = 0; t < count; t++) {
+    const style = rand() < 0.5 ? 0 : 0x80000000;
+    thumbs[pool[t]] = (t | style) >>> 0;
+    atlas.set(
+      X.subarray(pool[t] * IMAGE_SIZE, (pool[t] + 1) * IMAGE_SIZE),
+      t * IMAGE_SIZE
+    );
+  }
+
+  return { thumbs, atlas, count };
+}
+
+/** Duplicated from pca.ts / pacmap-webgpu.ts, which keep it module-private so
+ *  each stays standalone. Same generator, so a seed means the same thing. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -181,6 +255,9 @@ async function go() {
 
     // --- Data --------------------------------------------------------------
     const { X, labels } = await loadMnist(N, status);
+
+    // Before the PCA below, which runs in place and overwrites X.
+    const thumbs = buildDigitThumbs(X, N, params.seed);
 
     status("Projecting 784d → 100d (randomized PCA)…");
     await frame();
@@ -262,6 +339,22 @@ async function go() {
     new Uint32Array(labelBuf.getMappedRange()).set(Uint32Array.from(labels));
     labelBuf.unmap();
 
+    const thumbBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.VERTEX,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(thumbBuf.getMappedRange()).set(thumbs.thumbs);
+    thumbBuf.unmap();
+
+    const atlasBuf = device.createBuffer({
+      size: thumbs.atlas.byteLength,
+      usage: GPUBufferUsage.STORAGE,
+      mappedAtCreation: true,
+    });
+    new Float32Array(atlasBuf.getMappedRange()).set(thumbs.atlas);
+    atlasBuf.unmap();
+
     const boundsStorage = device.createBuffer({
       size: BOUNDS_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
@@ -270,12 +363,13 @@ async function go() {
       size: BOUNDS_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    // 80 bytes: viewProj mat4, res vec2, radius, pad. See `struct View`.
+    // 88 bytes rounded up to the struct's 16-byte alignment: viewProj mat4, res
+    // vec2, radius, occlude, digits, digitScale. See `struct View`.
     const viewUniform = device.createBuffer({
-      size: 80,
+      size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    const viewUniformData = new Float32Array(20);
+    const viewUniformData = new Float32Array(24);
 
     // --- Playback history --------------------------------------------------
     // One slot per captured frame, plus slot 0 for the pre-optimization init.
@@ -337,6 +431,11 @@ async function go() {
           visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: "uniform" },
         },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
       ],
     });
     const renderDesc: GPURenderPipelineDescriptor = {
@@ -362,6 +461,12 @@ async function go() {
             arrayStride: 4,
             stepMode: "instance",
             attributes: [{ shaderLocation: 1, offset: 0, format: "uint32" }],
+          },
+          {
+            // Tile index + style bit; NO_THUMB for a point drawn as a disc.
+            arrayStride: 4,
+            stepMode: "instance",
+            attributes: [{ shaderLocation: 2, offset: 0, format: "uint32" }],
           },
         ],
       },
@@ -423,6 +528,7 @@ async function go() {
       entries: [
         { binding: 0, resource: { buffer: boundsUniform } },
         { binding: 1, resource: { buffer: viewUniform } },
+        { binding: 2, resource: { buffer: atlasBuf } },
       ],
     });
 
@@ -464,6 +570,8 @@ async function go() {
       m[17] = canvas.height;
       m[18] = radius;
       m[19] = occludingNow() ? 1 : 0;
+      m[20] = view.digits ? 1 : 0;
+      m[21] = view.digitScale;
       device.queue.writeBuffer(viewUniform, 0, m);
 
       // Sized with the canvas, and only in 3D. Recreated rather than resized —
@@ -553,6 +661,7 @@ async function go() {
       rp.setBindGroup(0, renderBG);
       rp.setVertexBuffer(0, posBuf, offset, frameBytes);
       rp.setVertexBuffer(1, labelBuf);
+      rp.setVertexBuffer(2, thumbBuf);
       rp.draw(6, N);
       rp.end();
     }
@@ -823,7 +932,16 @@ function frame(): Promise<void> {
 // `occlusion` is read only in 3D (see `occludingNow` in `go()`), where it
 // decides between an opaque, depth-tested cloud and the blended haze that is
 // the only sensible thing to draw when every point is coplanar.
-const view = { pointSize: 1.8, autoZoom: true, occlusion: true };
+const view = {
+  pointSize: 1.8,
+  autoZoom: true,
+  occlusion: true,
+  digits: true,
+  // A digit at the point size would be a few pixels across — a smudge, not a
+  // glyph — so thumbnails get their own multiplier rather than dragging the
+  // whole cloud up with them.
+  digitScale: 8,
+};
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
 let onViewChange: (() => void) | null = null;
@@ -1029,6 +1147,19 @@ viewFolder
 // live phase dirty enough to have one.
 const occlusionBinding = viewFolder
   .addBinding(view, "occlusion", { label: "occlusion" })
+  .on("change", () => onViewChange?.());
+// Both ride in the view uniform like `occlusion`, so there is nothing to
+// install for them either.
+viewFolder
+  .addBinding(view, "digits", { label: "digit thumbs" })
+  .on("change", () => onViewChange?.());
+viewFolder
+  .addBinding(view, "digitScale", {
+    label: "digit scale",
+    min: 1,
+    max: 20,
+    step: 0.5,
+  })
   .on("change", () => onViewChange?.());
 // Double-clicking the canvas does the same thing.
 viewFolder

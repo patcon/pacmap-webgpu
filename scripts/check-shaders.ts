@@ -48,6 +48,10 @@ const STRICT = process.argv.includes("--strict");
 // format are validated against each other at draw time.
 const DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
 
+// One MNIST tile. The atlas in the draw case below is a single tile — the count
+// is irrelevant there, only that the binding is accepted under the pipeline.
+const TILE = 28;
+
 type Case = {
   name: string;
   code: string;
@@ -205,6 +209,13 @@ const cases: Case[] = [
               stepMode: "instance",
               attributes: [{ shaderLocation: 1, offset: 0, format: "uint32" as const }],
             },
+            {
+              // The digit-thumbnail tile + style. A vertex input no buffer
+              // supplies fails right here.
+              arrayStride: 4,
+              stepMode: "instance",
+              attributes: [{ shaderLocation: 2, offset: 0, format: "uint32" as const }],
+            },
           ],
         },
         fragment: {
@@ -281,6 +292,13 @@ const cases: Case[] = [
             visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
             buffer: { type: "uniform" as const },
           },
+          // The digit-thumbnail atlas. A storage buffer read from the fragment
+          // stage, which is a binding kind nothing else here uses.
+          {
+            binding: 2,
+            visibility: GPUShaderStage.FRAGMENT,
+            buffer: { type: "read-only-storage" as const },
+          },
         ],
       });
       const desc: GPURenderPipelineDescriptor = {
@@ -301,6 +319,13 @@ const cases: Case[] = [
               stepMode: "instance",
               attributes: [
                 { shaderLocation: 1, offset: 0, format: "uint32" as const },
+              ],
+            },
+            {
+              arrayStride: 4,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 2, offset: 0, format: "uint32" as const },
               ],
             },
           ],
@@ -324,17 +349,23 @@ const cases: Case[] = [
 
       const uniform = (size: number) =>
         device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM });
+      const atlas = device.createBuffer({
+        size: TILE * TILE * 4,
+        usage: GPUBufferUsage.STORAGE,
+      });
       const bindGroup = device.createBindGroup({
         layout: bgl,
         entries: [
           { binding: 0, resource: { buffer: uniform(32) } }, // Bounds
-          { binding: 1, resource: { buffer: uniform(80) } }, // View
+          { binding: 1, resource: { buffer: uniform(96) } }, // View
+          { binding: 2, resource: { buffer: atlas } }, // one f32 per texel
         ],
       });
       const vbuf = (size: number) =>
         device.createBuffer({ size, usage: GPUBufferUsage.VERTEX });
       const positions = vbuf(M * 12);
       const labels = vbuf(M * 4);
+      const thumbs = vbuf(M * 4);
 
       for (const occlude of [false, true]) {
         const bundle = device.createRenderBundleEncoder({
@@ -345,6 +376,7 @@ const cases: Case[] = [
         bundle.setBindGroup(0, bindGroup);
         bundle.setVertexBuffer(0, positions);
         bundle.setVertexBuffer(1, labels);
+        bundle.setVertexBuffer(2, thumbs);
         bundle.draw(6, M);
         bundle.finish();
       }
