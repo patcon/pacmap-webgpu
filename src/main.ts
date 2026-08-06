@@ -1145,56 +1145,8 @@ const pane = new Pane({
   title: "controls",
 });
 
-const viewFolder = pane.addFolder({ title: "view" });
-viewFolder
-  .addBinding(view, "pointSize", {
-    label: "point size",
-    min: 0.05,
-    max: 2,
-    step: 0.05,
-  })
-  .on("change", () => onViewChange?.());
-// Nothing to install for this one: the post-run rAF redraws every tick and
-// `captureAndDraw` re-reads it per captured frame, so a toggle lands on the next
-// frame either way. `onViewChange` is here only to keep the two bindings alike.
-viewFolder
-  .addBinding(view, "autoZoom", { label: "auto zoom" })
-  .on("change", () => onViewChange?.());
-// Nothing to install here either — the flag rides in the view uniform, which
-// `resize()` rewrites on the next redraw, and `onViewChange` is what marks the
-// live phase dirty enough to have one.
-const occlusionBinding = viewFolder
-  .addBinding(view, "occlusion", { label: "occlusion" })
-  .on("change", () => onViewChange?.());
-// Both ride in the view uniform like `occlusion`, so there is nothing to
-// install for them either.
-viewFolder
-  .addBinding(view, "digitPct", {
-    label: "digit %",
-    min: 0,
-    max: 100,
-    step: 0.5,
-  })
-  .on("change", () => onViewChange?.());
-viewFolder
-  .addBinding(view, "digitScale", {
-    label: "digit scale",
-    min: 1,
-    max: 20,
-    step: 0.5,
-  })
-  .on("change", () => onViewChange?.());
-viewFolder
-  .addBinding(view, "digitStyle", {
-    label: "digit style",
-    options: DIGIT_STYLES,
-  })
-  .on("change", () => onViewChange?.());
-// Double-clicking the canvas does the same thing.
-viewFolder
-  .addButton({ title: "reset camera" })
-  .on("click", () => resetCamera());
-
+// First, because it is where a run starts: nothing in `rendering` below matters
+// until something has been embedded.
 const pacmapFolder = pane.addFolder({ title: "dimensional reduction" });
 
 // Every parameter below is shared by all four entries — LocalMAP inherits
@@ -1333,6 +1285,56 @@ pacmapFolder.addBinding(params, "fpRatio", {
 // The seed drives pair sampling and the Gaussian init, so scrubbing it is how
 // you tell a stable structure from an artifact of one layout.
 pacmapFolder.addBinding(params, "seed", { min: 0, max: 999, step: 1 });
+
+const viewFolder = pane.addFolder({ title: "rendering" });
+viewFolder
+  .addBinding(view, "pointSize", {
+    label: "point size",
+    min: 0.05,
+    max: 2,
+    step: 0.05,
+  })
+  .on("change", () => onViewChange?.());
+// Nothing to install for this one: the post-run rAF redraws every tick and
+// `captureAndDraw` re-reads it per captured frame, so a toggle lands on the next
+// frame either way. `onViewChange` is here only to keep the two bindings alike.
+viewFolder
+  .addBinding(view, "autoZoom", { label: "auto zoom" })
+  .on("change", () => onViewChange?.());
+// Nothing to install here either — the flag rides in the view uniform, which
+// `resize()` rewrites on the next redraw, and `onViewChange` is what marks the
+// live phase dirty enough to have one.
+const occlusionBinding = viewFolder
+  .addBinding(view, "occlusion", { label: "occlusion" })
+  .on("change", () => onViewChange?.());
+// All three ride in the view uniform like `occlusion`, so there is nothing to
+// install for them either.
+viewFolder
+  .addBinding(view, "digitPct", {
+    label: "digit %",
+    min: 0,
+    max: 100,
+    step: 0.5,
+  })
+  .on("change", () => onViewChange?.());
+viewFolder
+  .addBinding(view, "digitScale", {
+    label: "digit scale",
+    min: 1,
+    max: 20,
+    step: 0.5,
+  })
+  .on("change", () => onViewChange?.());
+viewFolder
+  .addBinding(view, "digitStyle", {
+    label: "digit style",
+    options: DIGIT_STYLES,
+  })
+  .on("change", () => onViewChange?.());
+// Double-clicking the canvas does the same thing.
+viewFolder
+  .addButton({ title: "reset camera" })
+  .on("click", () => resetCamera());
 
 // Bindings all exist now, so the pane can be brought in line with whatever
 // `?algo=` and `?dims=` selected. Also draws the first cost hint.
