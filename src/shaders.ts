@@ -133,17 +133,26 @@ fn vs(
   // up and the canvas filled with colour. A point clumped on screen is
   // genuinely clumped; drawing it small is right.
   //
-  // Clamping the depth rather than the size handles both ends of that in one
-  // expression: it caps growth at MAX_GROW×, and it disposes of w <= 0 for
-  // points behind the camera (Orbit's minDistance lets the camera inside the
-  // cloud), which would otherwise invert the quad. The natural in-cloud
-  // variation at the default framing is only about 0.73x–1.6x, so a cap of 4
-  // is well clear of it and bites only once the camera has dollied in among
-  // the points — which is exactly when the runaway used to start.
+  // Two separate guards, because they answer two separate questions.
+  //
+  // The floor on w is only about w <= 0 — points behind the camera, which
+  // Orbit's minDistance makes reachable, and whose negative w would invert
+  // the quad. It is deliberately tiny: a quad whose vertices all sit behind
+  // the near plane is clipped whole, so this only has to keep the arithmetic
+  // sane on the way there, not bound the size.
+  //
+  // Bounding the size is maxPx's job, and it is expressed as a fraction of
+  // the viewport rather than as a multiple of V.radius. A multiple caps the
+  // wrong quantity: what should never happen is one point covering the
+  // canvas, and how many radii that takes depends on the canvas. This lets a
+  // point at the lens grow to half the short side and no further. The near
+  // plane (0.01, the camera in main.ts) is the other limit and sits at about
+  // 240x, so between them a close point gets genuinely large before it is
+  // clipped — which is the point of a perspective size cue.
   const REF_DIST = ${refDist};
-  const MAX_GROW = 4.0;
-  let pxAtDepth = V.radius * REF_DIST / max(clip.w, REF_DIST / MAX_GROW);
-  let drawPx = max(pxAtDepth, 1.0);
+  let maxPx = 0.25 * min(V.res.x, V.res.y);
+  let pxAtDepth = V.radius * REF_DIST / max(clip.w, 1e-4);
+  let drawPx = clamp(pxAtDepth, 1.0, maxPx);
   // Below one device pixel there is nothing left to shrink, so the shortfall
   // is spent as opacity instead of a floor that would make near and far
   // points read as the same size — same trick as the reference's vFade.
