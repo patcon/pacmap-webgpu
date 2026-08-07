@@ -114,6 +114,35 @@ const BOUNDS_BYTES = 32;
 // state declares, which check-shaders builds against the same constant.
 const DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
 
+// Straight source-over. Shared by the point renderer and the edge overlay, and
+// they have to agree: the edges are drawn into the same pass immediately before
+// the points, so a different blend would make an edge composite against the
+// cloud differently than the cloud composites against itself.
+const ALPHA_BLEND: GPUBlendState = {
+  color: {
+    srcFactor: "src-alpha",
+    dstFactor: "one-minus-src-alpha",
+    operation: "add",
+  },
+  // Not src-alpha, so the destination alpha accumulates rather than being
+  // scaled by the source's — the canvas is composited against the page.
+  alpha: {
+    srcFactor: "one",
+    dstFactor: "one-minus-src-alpha",
+    operation: "add",
+  },
+};
+
+// Occlusion's depth state, and the other half of the agreement above: both
+// pipelines are set in one pass, and a pass carrying a depth attachment can
+// only be drawn with pipelines that declare depth state. Both build their
+// occluded variant from this, so neither can drift from the attachment.
+const DEPTH_STATE: GPUDepthStencilState = {
+  format: DEPTH_FORMAT,
+  depthWriteEnabled: true,
+  depthCompare: "less",
+};
+
 // With auto zoom off the whole trace is framed by one box, and during a live run
 // the box that frames the *final* frame is not yet known. The previous run's is
 // the best guess available, so it is carried across runs and page reloads. Same
@@ -478,25 +507,38 @@ async function go() {
         },
       ],
     });
+    /**
+     * One keyframe of positions as a vertex buffer.
+     *
+     * The stride is the same `d` the shader was generated with and the same one
+     * `frameBytes` is sized from; those three cannot be allowed to disagree, so
+     * they are expressed once. Step mode is the caller's because it is the one
+     * real difference between the two consumers: the point renderer draws one
+     * instance per point, while the edge overlay walks the same memory per
+     * vertex, two vertices to a line, fetched through an index buffer.
+     */
+    const posLayout = (
+      shaderLocation: number,
+      stepMode: GPUVertexStepMode
+    ): GPUVertexBufferLayout => ({
+      arrayStride: 4 * nComponents,
+      stepMode,
+      attributes: [
+        {
+          shaderLocation,
+          offset: 0,
+          format: `float32x${nComponents}` as GPUVertexFormat,
+        },
+      ],
+    });
+
     const renderDesc: GPURenderPipelineDescriptor = {
       layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
       vertex: {
         module: renderModule,
         entryPoint: "vs",
         buffers: [
-          {
-            // Same `d` the shader was generated with and the same one
-            // `frameBytes` is sized from; they cannot be allowed to disagree.
-            arrayStride: 4 * nComponents,
-            stepMode: "instance",
-            attributes: [
-              {
-                shaderLocation: 0,
-                offset: 0,
-                format: `float32x${nComponents}` as GPUVertexFormat,
-              },
-            ],
-          },
+          posLayout(0, "instance"),
           {
             arrayStride: 4,
             stepMode: "instance",
@@ -508,43 +550,17 @@ async function go() {
             stepMode: "instance",
             attributes: [{ shaderLocation: 2, offset: 0, format: "uint32" }],
           },
-          {
-            // The next keyframe. Same shape as slot 0 and, on the playback
-            // path, the same buffer — bound one slot along. Binding one buffer
-            // to two vertex slots at different offsets is legal; vertex buffers
-            // are read-only.
-            arrayStride: 4 * nComponents,
-            stepMode: "instance",
-            attributes: [
-              {
-                shaderLocation: 3,
-                offset: 0,
-                format: `float32x${nComponents}` as GPUVertexFormat,
-              },
-            ],
-          },
+          // The next keyframe. Same shape as slot 0 and, on the playback path,
+          // the same buffer — bound one slot along. Binding one buffer to two
+          // vertex slots at different offsets is legal; vertex buffers are
+          // read-only.
+          posLayout(3, "instance"),
         ],
       },
       fragment: {
         module: renderModule,
         entryPoint: "fs",
-        targets: [
-          {
-            format,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
+        targets: [{ format, blend: ALPHA_BLEND }],
       },
       primitive: { topology: "triangle-list" },
     };
@@ -554,14 +570,7 @@ async function go() {
     // can use it.
     const renderPipeDepth =
       nComponents === 3
-        ? device.createRenderPipeline({
-            ...renderDesc,
-            depthStencil: {
-              format: DEPTH_FORMAT,
-              depthWriteEnabled: true,
-              depthCompare: "less",
-            },
-          })
+        ? device.createRenderPipeline({ ...renderDesc, depthStencil: DEPTH_STATE })
         : null;
     /**
      * Is this frame drawn occluded?
@@ -651,48 +660,21 @@ async function go() {
         ],
       });
 
-      // The same two keyframes the point draw binds, at "vertex" step mode
-      // rather than "instance" — same memory, different pipeline, different
-      // layout. An edge is two of these, fetched through the index buffer.
-      const posAttr = (shaderLocation: number): GPUVertexBufferLayout => ({
-        arrayStride: 4 * nComponents,
-        stepMode: "vertex",
-        attributes: [
-          {
-            shaderLocation,
-            offset: 0,
-            format: `float32x${nComponents}` as GPUVertexFormat,
-          },
-        ],
-      });
       const edgeModule = device.createShaderModule({ code: edgeWGSL(nComponents) });
       const desc: GPURenderPipelineDescriptor = {
         layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
         vertex: {
           module: edgeModule,
           entryPoint: "vs",
-          buffers: [posAttr(0), posAttr(1)],
+          // The same two keyframes the point draw binds, at "vertex" step mode
+          // rather than "instance" — same memory, different pipeline, different
+          // layout. An edge is two of these, fetched through the index buffer.
+          buffers: [posLayout(0, "vertex"), posLayout(1, "vertex")],
         },
         fragment: {
           module: edgeModule,
           entryPoint: "fs",
-          targets: [
-            {
-              format,
-              blend: {
-                color: {
-                  srcFactor: "src-alpha",
-                  dstFactor: "one-minus-src-alpha",
-                  operation: "add",
-                },
-                alpha: {
-                  srcFactor: "one",
-                  dstFactor: "one-minus-src-alpha",
-                  operation: "add",
-                },
-              },
-            },
-          ],
+          targets: [{ format, blend: ALPHA_BLEND }],
         },
         primitive: { topology: "line-list" },
       };
@@ -708,14 +690,7 @@ async function go() {
         // how it looks.
         pipeDepth:
           nComponents === 3
-            ? device.createRenderPipeline({
-                ...desc,
-                depthStencil: {
-                  format: DEPTH_FORMAT,
-                  depthWriteEnabled: true,
-                  depthCompare: "less",
-                },
-              })
+            ? device.createRenderPipeline({ ...desc, depthStencil: DEPTH_STATE })
             : null,
         bindGroup,
       };
