@@ -45,8 +45,13 @@ export interface EdgeRange {
  * moves an index count and nothing else, no buffer rewritten and no run
  * restarted — and it means edges appear spread through the cloud rather than
  * walking along the sample order. Exactly the argument `digit %` rests on, and
- * the reason every pair is held rather than a sampled subset: 8 bytes each, so
- * ~3M pairs at N=65k is ~24MB, against the digit atlas's 51MB.
+ * the reason every pair is held rather than a sampled subset.
+ *
+ * The cost of holding all of them is 8 bytes a pair, and a point draws
+ * `nNB + nMN + nFP` of them — 35 at the demo's defaults (10 neighbours, then
+ * `round(nNB * 0.5)` and `round(nNB * 2)`). So 65k points is 2.3M pairs and
+ * 18MB, or 5.0M and 40MB with "auto neighbors" ticked, where `defaultNeighbors`
+ * puts nNB at 22. Against the digit atlas's 51MB, either is the small one.
  *
  * `rand` is supplied rather than seeded here, so the caller owns the policy —
  * the demo derives it from the run's seed, which is what makes two runs at one
