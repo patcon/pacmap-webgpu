@@ -80,6 +80,49 @@ A 3D frame is 50% larger, so at the same 128MB history budget a 3D run banks
 fewer frames — or captures every *n*th iteration instead. The status line says
 which.
 
+## Seeing the pairs
+
+PaCMAP's whole mechanism is three sets of pairs pulling and pushing on each
+other, and the animation shows only the result. Tick `show edges` in the
+`pair graph` folder to draw the pairs themselves:
+
+| | colour | per point | what it does |
+|---|---|---|---|
+| neighbors | green | `n_neighbors` — 10 by default | pull, throughout |
+| mid-near | yellow | `round(n_neighbors * MN_ratio)` — 5 | pull, but only for the first 200 of 450 iterations |
+| far | red | `round(n_neighbors * FP_ratio)` — 20 | push, throughout |
+
+Every pair drawn is a pair that acts: the optimizer walks all three sets on
+every iteration and never subsamples them. The selection happens once, when the
+pairs are drawn at setup — mid-near, for instance, samples six candidates and
+keeps the second-closest, and the five losers are never stored.
+
+Two things are easy to misread:
+
+- **Those counts are what a point *draws*, not its degree.** Each pair acts on
+  both of its endpoints, so a point is also pulled by everyone who picked *it*.
+  At 100% you will see roughly twice the number above touching any given point.
+  That is why `% far` defaults to 5: 20 drawn each, doubled, is fog.
+- **Yellow goes inert.** `w_MN` is 0 for the whole of phase 3, so for the last
+  250 iterations the mid-near pairs still exist and still draw but exert no
+  force at all. Nothing on screen distinguishes those two states — edge opacity
+  is deliberately not tied to weight.
+
+The three percentages are **render-time**. The index buffer holds every pair, so
+a slider moves a draw count: no buffer is rewritten and no run restarts, and
+because each set is shuffled once at setup, a percentage is a uniform sample
+spread through the cloud rather than a prefix of the sample order.
+
+Two limitations, both visible rather than subtle:
+
+- Under `?algo=localmap` the red edges are the further pairs **as first drawn**.
+  LocalMAP redraws them against the embedding 24 times during phase 3, on the
+  GPU, and those redraws never come back to the host — so the red edges sit
+  still while the points move. The folder title says so when LocalMAP is
+  selected.
+- The overlay needs the pair graph, and DruidJS builds its own neighbour graph
+  internally without exposing it. The folder is greyed under both CPU engines.
+
 ## Two algorithms
 
 Pick one from the `algorithm` dropdown, or with `?algo=`:
@@ -161,6 +204,8 @@ substituted neighbor is.
 - `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
 - `src/mnist.ts` — sprite loader
 - `src/pca.ts` — randomized PCA
+- `src/edges.ts` — the pair-graph overlay's index buffer. Its own module, with
+  no DOM, so it can be checked headlessly — see `CLAUDE.md`.
 - `src/main.ts` — demo wiring, bounds reduce, point renderer
 
 ## Caveats

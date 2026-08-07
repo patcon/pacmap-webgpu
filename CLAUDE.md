@@ -34,9 +34,15 @@ Pipeline, in order (`src/main.ts` `go()` wires it all):
 3. `src/pacmap-webgpu.ts` — the library. No DOM dependencies, reusable.
    `src/druid-cpu.ts` + `src/druid-worker.ts` + `src/druid-protocol.ts` — the CPU
    alternative, presenting the same `EmbeddingRun` surface. See its section below.
-4. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, playback transport, Tweakpane view controls, DOM/status.
+4. `src/edges.ts` — the pair-graph overlay's index buffer. No DOM and no device, so it is importable by the headless checks; see its section below for why that matters.
+5. `src/main.ts` — demo wiring: bounds-reduce compute pass, instanced point renderer, pair-graph line overlay, playback transport, Tweakpane view controls, DOM/status.
 
-The pane has two folders with different lifetimes, ordered by which comes first in a session. `dimensional reduction` (algorithm, components, low_dist_thres, kNN backend, n_neighbors, MN/FP pair ratios, seed) is setup-time: the kNN graph is built and pairs sampled before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight — which is now the only thing signalling that lifetime, since the folder title no longer says "next run". The `algorithm`, `components` and `kNN algo` dropdowns are seeded from `?algo=`, `?dims=` and `?knn=` and own their values after that. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit. Under the CPU engine it is resolved to `defaultNeighbors(N)` explicitly instead, because druid has no equivalent rule to fall back on. `rendering` sits below it and is live — an edit rewrites the current run's uniform.
+The pane has three folders, two of them with different lifetimes, ordered by which comes first in a session. `dimensional reduction` (algorithm, components, low_dist_thres, kNN backend, n_neighbors, MN/FP pair ratios, seed) is setup-time: the kNN graph is built and pairs sampled before the first iteration, so those values are read at the top of `go()` and the folder is disabled while a run is in flight — which is now the only thing signalling that lifetime, since the folder title no longer says "next run". The `algorithm`, `components` and `kNN algo` dropdowns are seeded from `?algo=`, `?dims=` and `?knn=` and own their values after that. `nNeighbors` is sent as `undefined` while "auto neighbors" is on, which is what lets the library's own default apply; the slider mirrors `defaultNeighbors(N)` so the value is visible rather than implicit. Under the CPU engine it is resolved to `defaultNeighbors(N)` explicitly instead, because druid has no equivalent rule to fall back on. `rendering` sits below it and is live — an edit rewrites the current run's uniform. `pair graph`
+sits below that and is live too, for a stronger reason: the index buffer holds every pair, so a
+percentage moves a draw count rather than rewriting anything. It is its own folder rather than more
+`rendering` rows because it is about the algorithm's structure where that folder is about how the
+cloud is drawn, and it is greyed under both CPU engines by the same `syncAlgorithm` that greys
+`kNN algo`.
 
 The `algorithm` dropdown carries **both** axes — which algorithm, and whose implementation — as one `AlgoKey` (`pacmap-gpu`, `localmap-cpu`, …), with `VARIANT_OF` / `ENGINE_OF` splitting it at the point of use. They are one control because there is no reason to pick "LocalMAP" and then separately pick "on the CPU", and one control cannot disagree with itself. Selecting a CPU entry greys out `kNN algo`: druid builds its own neighbour graph and would ignore it.
 
@@ -73,6 +79,91 @@ Five things carry it:
 - **`buildDigitAtlas` must run before `pcaProject`**, which is called with `inPlace: true` and overwrites `X`. Afterwards it reads plausible noise rather than raising anything.
 - **Rank is drawn from the run's seed**, so two runs at one seed show the same digits — otherwise comparing them would also be comparing two different samples.
 - **Digits get their own size multiplier** (`digit scale`, 1–20). At the point size a digit is a handful of pixels — a smudge, not a glyph — and raising `pointSize` to fix that would drag the whole cloud up with it. In 3D the multiplier lands *before* the existing `maxPx` clamp, so depth falloff and the viewport-fraction cap both still apply. Occluded, a thumbnail's near-transparent fragments are discarded rather than written: a fragment that writes depth hides what is behind it, and most of a digit's square is background — a disc never had that much empty area to give away.
+
+### The pair graph overlay (`edges.ts`, `shaders.ts`, `main.ts`)
+
+The three pair sets drawn as coloured lines — near green, mid-near yellow,
+further red — from the `pair graph` folder. `PacmapRun.graph` is where they come
+from: `nbFwd` and `fpFwd` already existed for the LocalMAP resample, and `mnFwd`
+was added alongside them. The mid-near loop writes **one local** into both
+`mnFwd` and the CSR triple, so there is nothing for a check to hold in
+agreement; the alternative was exposing the CSR purely for a test.
+
+Six things carry it:
+
+- **An indexed `line-list` over the same position buffer the points are drawn
+  from.** That choice is most of the design. Positions as a *storage* buffer
+  indexed per edge is the obvious alternative and does not work here: reaching a
+  playback keyframe needs a dynamic offset, a storage binding's dynamic offset
+  must be 256-byte aligned, and `frameBytes = N*4*d` generally is not (520,000
+  at N=65k, d=2) — while binding all of `posHistory` instead runs into its 128MB
+  budget being exactly the default `maxStorageBufferBindingSize`. Indexing also
+  makes playback interpolation free: slot `a` to vertex buffer 0, slot `b` to 1,
+  and the mix is the one the point shader already runs. Edges are encoded
+  **first, into the same pass** as the points, so the cloud sits on top; a second
+  pass with `loadOp: "load"` would cost a pass per frame for nothing.
+- **The pair kind is not in the shader.** On an indexed draw
+  `@builtin(vertex_index)` is the *fetched index value*, not the position in the
+  index buffer, so it cannot be compared against a range boundary — which rules
+  out the obvious "one buffer, three ranges, derive the kind" trick. Instead one
+  index buffer holds the three kinds in three contiguous ranges and the colour
+  arrives per draw through a **dynamic-offset uniform**, 256-byte slot per kind.
+  Same mechanism the optimizer uses for its per-iteration weights.
+- **The structs and the data→world mapping are shared *text*.** `BOUNDS_STRUCT`,
+  `VIEW_STRUCT` and `worldStatements(d)` are spliced into both `renderWGSL` and
+  `edgeWGSL`. An edge placed by even slightly different arithmetic than its own
+  endpoints would detach from them, and the framing is mixed per frame, so the
+  disagreement would come and go. Spliced as statements rather than factored into
+  a WGSL function so `renderWGSL`'s output is unchanged — verified, every
+  non-comment line identical at d=2 and d=3.
+- **The depth pipeline is mandatory, not a nicety.** When occlusion is on the
+  pass carries a depth attachment, and a pipeline *without* depth state cannot be
+  used in a pass that has one — a validation error, not a difference in looks.
+  `occludingNow()` picks both pipelines, and the fragment paints opaque when
+  occluding for the same reason the point shader does.
+- **Each range is shuffled once at setup**, so any prefix is a uniform random
+  sample of that kind. That is what makes the percentage render-time: it moves a
+  draw count, no buffer rewritten and no run restarted, and edges appear spread
+  through the cloud rather than walking the sample order. Same argument `digit %`
+  rests on, and the same reason every pair is held rather than a sampled subset —
+  8 bytes each, so 2.3M pairs and 18MB at the demo's defaults at N=65k (5.0M and
+  40MB with auto neighbors, where `defaultNeighbors` puts nNB at 22), against the
+  digit atlas's 51MB. Seeded from the run's seed, so two runs at one seed draw
+  the same sample.
+- **`buildEdgeIndices` lives in `src/edges.ts`, not `main.ts`.** It is the one
+  piece of the overlay whose mistakes are off-by-ones rather than validation
+  errors — an edge between the wrong two points is a plausible mesh — and
+  leaving it with the rest of the renderer would have made it permanently
+  browser-only. As a pure function it is checkable as *data* even though it is
+  not checkable as an image; see the coverage note below.
+
+Two things the overlay does **not** say, both deliberate and both easy to
+misread off the screen:
+
+- **Nothing varies with weight.** Alpha is a flat 0.35. The weights swing three
+  orders of magnitude over a run (`w_MN` 1000→3), so encoding them is its own
+  design problem.
+- **`w_MN` is 0 for the whole of phase 3.** The mid-near pairs still exist and
+  still draw for the last 250 of 450 iterations while exerting no force at all,
+  and nothing on screen distinguishes that from the first 200. The slider is
+  labelled `% mid-near (pos)`, which overstates it; the folder has no room for
+  the caveat, so it lives here and in `README.md`.
+
+Counts, since they are asked about: a point draws `nNB + nMN + nFP` pairs — 35 at
+the demo's defaults, `nNeighbors` being 10 with auto neighbors off, then
+`round(nNB * 0.5)` and `round(nNB * 2)`. But every pair acts on *both* endpoints,
+so a point's degree is about twice that, and the drawn overlay looks
+correspondingly denser than the per-point numbers suggest. That is why `% far`
+defaults to 5 against 100 for the other two.
+
+Under LocalMAP the red edges are the further pairs **as first drawn**: the
+resample redraws them on the GPU 24 times during phase 3 and never sends them
+back, so they sit still while the points move. Reflecting it would mean the index
+buffer becoming GPU-written, which is a larger change than the whole overlay. The
+folder title says so when a LocalMAP variant is selected. The folder is greyed
+under both CPU engines — `EmbeddingRun.graph` is optional and druid, which builds
+its own neighbour graph internally, leaves it undefined, so `go()` builds no
+overlay there at all.
 
 ### The camera (`main.ts`)
 
@@ -154,11 +245,15 @@ That mechanism goes further than compilation, which is what `scripts/check-kerne
 
 An oracle must not share code with what it checks. `check:kernels` recomputes the reverse CSR by bucket-then-flatten rather than calling `buildFpReverse`, and `buildFpReverse` stays unexported to keep that honest.
 
-Three coverage gaps are known, all of the same shape — the pieces are checked, the wiring between them is not. The third is the camera and the view controls: `check:shaders` proves the `View` struct compiles and pipelines and that both render pipelines can be drawn with one bind group, and the default framing was checked numerically against the formula it replaced, but no check sees a wheel, a drag, a rotation, the reset button, or the `components`, `occlusion`, `interpolation` and digit-thumbnail controls. Nothing headless renders a pixel, so the thumbnails in particular — whether a tile lands on the point it belongs to, and which way up — are visible only in a browser. Everything user-visible in the 2D/3D work was verified by hand in a browser. The second is `check:druid`, which covers the druid backends and the parameter mapping but not the worker handshake, the dropdown or the stop button; those need a browser. The first: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
+Three coverage gaps are known, all of the same shape — the pieces are checked, the wiring between them is not. The third is the camera and the view controls: `check:shaders` proves the `View` struct compiles and pipelines and that both render pipelines can be drawn with one bind group, and the default framing was checked numerically against the formula it replaced, but no check sees a wheel, a drag, a rotation, the reset button, or the `components`, `occlusion`, `interpolation`, digit-thumbnail and `pair graph` controls. Nothing headless renders a pixel, so the thumbnails in particular — whether a tile lands on the point it belongs to, and which way up — are visible only in a browser.
+
+The edge overlay is the one place that gap was narrowed rather than accepted, and the split is worth copying. Its *pipelines* are checked (`edge-{2,3}d{,-depth}` plus an `edge-3d-occlusion-draw` bundle case), and its *index buffer* is checked as data by `check:kernels`' `edges/*` section — every drawn line is a pair the optimizer holds, the three ranges tile the buffer, a prefix is shuffled, the sample is reproducible at one seed, and `nbFwd`'s pad entries do not ship. That last one needs a synthetic four-point graph: padding happens only when the candidate pool is smaller than nNB, i.e. at N ≤ nNeighbors, so no real fixture reaches it. What remains browser-only is whether an edge is drawn *on* its endpoints, which is a pixel question. **Two mutations that look like they should fail there do not, checked rather than assumed:** `setIndexBuffer` with `uint16` against a u32 buffer passes, because the index format is a byte-width declaration and not a claim about contents; and a `float32x2` attribute against a `vec3<f32>` input passes, because WebGPU fills the missing components. Don't add either as a "check". Everything user-visible in the 2D/3D work was verified by hand in a browser. The second is `check:druid`, which covers the druid backends and the parameter mapping but not the worker handshake, the dropdown or the stop button; those need a browser. The first: `check:kernels` covers the resample *kernels* but not their *wiring* into `runRange`. Deleting the schedule guard leaves every check green, because LocalMAP's near-pair coefficient alone is enough to make the two variants differ. Touching that block means running `npm run check:ab -- <ref> --variant=localmap`, which sees it.
 
 `npm run check:shaders` is that mechanism, standing: `scripts/check-shaders.ts` compiles every WGSL source under Dawn and builds the real pipeline for every entry point — the templated ones at both dimensionalities, so a `vec3` form that never compiled cannot hide until the dropdown is moved. Pipelines matter as much as modules — a renamed entry point, an incompatible bind-group layout, or a bad vertex/blend state compiles clean and fails only at `createPipeline`.
 
-One case goes further and **encodes a draw**, because creating a pipeline says nothing about whether a bind group can be set under it or whether the target carries the attachments its state demands — the two mistakes that blank the canvas without raising anything a user sees. It uses a render **bundle** encoder, which takes attachment formats rather than views: that validates exactly those two things, and it is also the only way to encode a draw under these bindings at all, since `@kmamal/gpu`'s `createView()` unconditionally sends a component swizzle the adapter does not support, so no texture view can be made and no render pass begun. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader.
+One case goes further and **encodes a draw**, because creating a pipeline says nothing about whether a bind group can be set under it or whether the target carries the attachments its state demands — the two mistakes that blank the canvas without raising anything a user sees. It uses a render **bundle** encoder, which takes attachment formats rather than views: that validates exactly those two things, and it is also the only way to encode a draw under these bindings at all, since `@kmamal/gpu`'s `createView()` unconditionally sends a component swizzle the adapter does not support, so no texture view can be made and no render pass begun. This is why `src/shaders.ts` exists (`main.ts` touches the DOM at module scope, so its shaders had to move somewhere importable) and why `pacmap-webgpu.ts` exports `shaderSources`. Add a case there whenever you add a shader. `src/edges.ts` exists for the same reason one level down — not a shader but a pure function whose off-by-ones the shader checks cannot see.
+
+There are now two draw-encoding cases, the point one and `edge-3d-occlusion-draw`. The second adds the two things specific to an indexed draw through a dynamic-offset uniform, and three mutations were confirmed to fail on it: dropping `setIndexBuffer`, building the occluded pipeline without depth state while the bundle declares a depth format, and a dynamic offset that is not a multiple of `minUniformBufferOffsetAlignment`.
 
 Three design decisions carry most of the file:
 
@@ -184,6 +279,8 @@ Four things about it are worth knowing before touching it:
 - **The draw budget bounds every rejection path, which upstream's does not.** In the reference, the self-hit and distance-failure branches `continue` past the `if count > 100` escape, so a point with no eligible partner inside `low_dist_thres` never terminates. On a CPU that is a rarely-hit hang; on a GPU it takes out the device. The escape is plainly the intent, so it applies to all four rejection paths here.
 
 Under `variant: "pacmap"` the whole `fp` object is `null`: no extra buffers, no kernels encoded. The PaCMAP path is untouched rather than merely equivalent.
+
+One consequence reaches the demo: **the redrawn further pairs never come back to the host**, by design — that is what keeps `runRange` at one command buffer and no readback. So `PacmapRun.graph.fpFwd` stays the set sampled at setup, and the pair-graph overlay's red edges are that initial set for the whole run, visibly static while the points move. Reflecting the resample would mean the overlay's index buffer becoming GPU-written and rebuilt on the same schedule, which is a larger change than the overlay itself.
 
 The gradient shader sits at **8 storage buffers**, the default `maxStorageBuffersPerShaderStage`, with no headroom. If a ninth is ever needed, interleave `M` and `V` — same length, same access pattern, and `adam_main` already walks both in lockstep. The `check-shaders.ts` layout is what will catch the overflow.
 
