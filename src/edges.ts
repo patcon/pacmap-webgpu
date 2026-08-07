@@ -63,24 +63,26 @@ export function buildEdgeIndices(
   N: number,
   rand: () => number
 ): { indices: Uint32Array; ranges: Record<EdgeKind, EdgeRange> } {
-  const rows: Record<EdgeKind, [Uint32Array, number]> = {
-    near: [graph.nbFwd, graph.nNB],
-    midNear: [graph.mnFwd, graph.nMN],
-    further: [graph.fpFwd, graph.nFP],
+  // Each kind is a forward array of `width` partners per point, laid out row
+  // by row — the only two things this needs to know about any of them.
+  const rows: Record<EdgeKind, { fwd: Uint32Array; width: number }> = {
+    near: { fwd: graph.nbFwd, width: graph.nNB },
+    midNear: { fwd: graph.mnFwd, width: graph.nMN },
+    further: { fwd: graph.fpFwd, width: graph.nFP },
   };
 
   let total = 0;
-  for (const kind of EDGE_KINDS) total += rows[kind][0].length;
+  for (const kind of EDGE_KINDS) total += rows[kind].fwd.length;
   const idx = new Uint32Array(total * 2);
 
   const ranges = {} as Record<EdgeKind, EdgeRange>;
   let w = 0;
   for (const kind of EDGE_KINDS) {
-    const [arr, width] = rows[kind];
+    const { fwd, width } = rows[kind];
     const first = w;
     for (let i = 0; i < N; i++) {
       for (let k = 0; k < width; k++) {
-        const j = arr[i * width + k];
+        const j = fwd[i * width + k];
         // `nbFwd` pads short rows with N — possible only when the candidate
         // pool is smaller than nNB, i.e. at a handful of points. Not an edge.
         if (j >= N) continue;
@@ -90,16 +92,18 @@ export function buildEdgeIndices(
       }
     }
     // Fisher-Yates over whole pairs, not over the u32s: swapping individual
-    // indices would rewire the graph rather than reorder it.
+    // indices would rewire the graph rather than reorder it. Hence both
+    // endpoints moving together below.
     for (let e = (w - first) / 2 - 1; e > 0; e--) {
       const f = Math.floor(rand() * (e + 1));
-      for (let c = 0; c < 2; c++) {
-        const a = first + e * 2 + c;
-        const b = first + f * 2 + c;
-        const t = idx[a];
-        idx[a] = idx[b];
-        idx[b] = t;
-      }
+      const a = first + e * 2;
+      const b = first + f * 2;
+      const a0 = idx[a];
+      const a1 = idx[a + 1];
+      idx[a] = idx[b];
+      idx[a + 1] = idx[b + 1];
+      idx[b] = a0;
+      idx[b + 1] = a1;
     }
     ranges[kind] = { first, count: (w - first) / 2 };
   }
