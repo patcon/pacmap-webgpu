@@ -153,8 +153,12 @@ Counts, since they are asked about: a point draws `nNB + nMN + nFP` pairs — 35
 the demo's defaults, `nNeighbors` being 10 with auto neighbors off, then
 `round(nNB * 0.5)` and `round(nNB * 2)`. But every pair acts on *both* endpoints,
 so a point's degree is about twice that, and the drawn overlay looks
-correspondingly denser than the per-point numbers suggest. That is why `% far`
-defaults to 5 against 100 for the other two.
+correspondingly denser than the per-point numbers suggest. That is why all three
+sliders default low — 10 / 1 / 1 — rather than to the whole set: what is wanted
+is the *shape* of each relation, a sample big enough to read the structure and
+small enough to see the cloud through. Neighbours get the largest share because
+they are short and land inside clusters; mid-near and further both span the whole
+cloud, so a line of either crosses everything between its endpoints.
 
 Under LocalMAP the red edges are the further pairs **as first drawn**: the
 resample redraws them on the GPU 24 times during phase 3 and never sends them

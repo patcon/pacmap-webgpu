@@ -102,7 +102,11 @@ Two things are easy to misread:
 - **Those counts are what a point *draws*, not its degree.** Each pair acts on
   both of its endpoints, so a point is also pulled by everyone who picked *it*.
   At 100% you will see roughly twice the number above touching any given point.
-  That is why `% far` defaults to 5: 20 drawn each, doubled, is fog.
+  That is why the sliders default low — **10% / 1% / 1%** — and why the two that
+  span the cloud get the smaller share: a mid-near or far line crosses
+  everything between its endpoints, so a few percent of them reads as structure
+  where all of them reads as fog. Turn any of them up to see the whole relation;
+  the defaults are for seeing its shape.
 - **Yellow goes inert.** `w_MN` is 0 for the whole of phase 3, so for the last
   250 iterations the mid-near pairs still exist and still draw but exert no
   force at all. Nothing on screen distinguishes those two states — edge opacity

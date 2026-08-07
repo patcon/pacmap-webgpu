@@ -90,12 +90,18 @@ differ by 4x and the useful percentage differs with them.
 
 ### Defaults
 
-Edges default **off**. The point cloud is the thing being demonstrated and 3M lines over
-it is a wash of colour, so it is opt-in. When ticked: near 100%, mid-near 100%, further
-5% — the far pairs are both the most numerous and the least legible (they connect
-everything to everything, by construction), and 5% of them is enough to read as "outward
-pressure" without covering the canvas. Alpha is a fixed 0.35, not a slider, until it is
-shown to need one.
+Edges default **off**. The point cloud is the thing being demonstrated and millions of
+lines over it is a wash of colour, so it is opt-in. Alpha is a fixed 0.35, not a slider,
+until it is shown to need one.
+
+The percentages were planned at 100 / 100 / 5 and **landed at 10 / 1 / 1** once there was
+something to look at. The planned figures came from "show the whole set unless it is
+unaffordable", which is the wrong question: what is wanted is the *shape* of each relation,
+a sample big enough to read the structure and small enough to see the cloud through. Two
+things the plan underweighted — every pair also acts on the other endpoint, so drawn
+density is about double the per-point count; and mid-near and further both span the whole
+cloud, so a line of either crosses everything between its endpoints. Neighbours keep the
+largest share because they are short and land inside clusters, where there is room.
 
 ### Depth, and why the depth pipeline is not optional
 
@@ -295,7 +301,8 @@ playback — confirmed by hand.
 
 - New `edges` folder in the pane, below `rendering` and live like it (an edit rewrites the
   current run's state; no restart). Contents: `show edges` checkbox, then `near %`,
-  `mid-near %` and `further %` sliders (0–100, defaults 100 / 100 / 5).
+  `mid-near %` and `further %` sliders (0–100). Defaults landed at 10 / 1 / 1 rather
+  than the 100 / 100 / 5 planned here — see the note under the task.
 - Each slider resolves against its range's total on the CPU and moves a draw count. The
   shader learns nothing new.
 - The whole folder is disabled when `pm.graph` is absent — i.e. under both CPU engines —

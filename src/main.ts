@@ -1217,12 +1217,19 @@ const view = {
   // The pair-graph overlay. Off by default: the point cloud is the thing being
   // demonstrated and three million lines over it is a wash of colour.
   edges: false,
-  // Per kind, because the three counts differ by 4x and so does the useful
-  // percentage. Further pairs connect everything to everything by construction,
-  // so a few percent of them reads as outward pressure where all of them reads
-  // as fog. Render-time: the index buffer holds every pair and this moves a
-  // draw count. Sliders are Task 3; these are the values it will default to.
-  edgePct: { near: 100, midNear: 100, further: 5 } as Record<EdgeKind, number>,
+  // Per kind, and all three low, because what is wanted from the overlay is the
+  // *shape* of each relation rather than the whole of it — a sample big enough
+  // to read the structure and small enough to see the cloud through. Every one
+  // of these is a few percent of a set that also acts on the other endpoint, so
+  // the drawn density is about double what the number suggests.
+  //
+  // Neighbours get the largest share: they are the local structure, they are
+  // short, and they land inside clusters where there is room. Mid-near and
+  // further both span the whole cloud, so a line of either crosses everything
+  // between its endpoints — 1% of those is legible where 10% is a wash.
+  //
+  // Render-time: the index buffer holds every pair and this moves a draw count.
+  edgePct: { near: 10, midNear: 1, further: 1 } as Record<EdgeKind, number>,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
