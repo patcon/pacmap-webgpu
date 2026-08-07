@@ -1648,10 +1648,14 @@ const edgeFolder = pane.addFolder({ title: EDGE_TITLE });
 edgeFolder
   .addBinding(view, "edges", { label: "show edges" })
   .on("change", () => onViewChange?.());
+// (pos)/(neg) is the sign of the force, not of anything measured: near and
+// mid-near pull, further pushes. Mid-near's is true only for the first 200 of
+// 450 iterations — `weightsAt` sends w_MN to 0 for the whole of phase 3 — which
+// the folder cannot fit and `CLAUDE.md` records instead.
 const EDGE_LABELS: Record<EdgeKind, string> = {
-  near: "near % (attract)",
-  midNear: "mid-near % (w=0 in phase 3)",
-  further: "further % (repel)",
+  near: "% neighbors (pos)",
+  midNear: "% mid-near (pos)",
+  further: "% far (neg)",
 };
 for (const kind of EDGE_KINDS) {
   edgeFolder
