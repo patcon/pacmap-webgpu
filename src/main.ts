@@ -14,7 +14,6 @@ import {
   buildEdgeIndices,
   EDGE_KINDS,
   EDGE_COLORS,
-  EDGE_ALPHA,
   type EdgeKind,
 } from "./edges";
 import { Pane } from "tweakpane";
@@ -623,11 +622,13 @@ async function go() {
       const align = device.limits.minUniformBufferOffsetAlignment || 256;
       const styles = new Float32Array((align / 4) * EDGE_KINDS.length);
       EDGE_KINDS.forEach((kind, k) => {
-        styles.set([...EDGE_COLORS[kind], EDGE_ALPHA], (k * align) / 4);
+        styles.set([...EDGE_COLORS[kind], view.edgeAlpha / 100], (k * align) / 4);
       });
       const styleBuf = device.createBuffer({
         size: styles.byteLength,
-        usage: GPUBufferUsage.UNIFORM,
+        // COPY_DST too: onViewChange rewrites the alpha float live via
+        // writeBuffer, which silently no-ops against a buffer lacking it.
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         mappedAtCreation: true,
       });
       new Float32Array(styleBuf.getMappedRange()).set(styles);
@@ -761,7 +762,20 @@ async function go() {
     // rewriting the view uniform.
     let viewDirty = false;
     onViewChange = () => {
-      if (gen === runGen) viewDirty = true;
+      if (gen !== runGen) return;
+      viewDirty = true;
+      // The alpha float lives in each kind's EdgeStyle slot, not the view
+      // uniform, so it gets its own small writeBuffer here rather than
+      // riding along with viewDirty's redraw of `boundsUniform`/`viewUniform`.
+      if (edges) {
+        EDGE_KINDS.forEach((kind, k) => {
+          device.queue.writeBuffer(
+            edges.styleBuf,
+            k * edges.align + 12, // color is 3 floats, alpha is the 4th
+            new Float32Array([view.edgeAlpha / 100])
+          );
+        });
+      }
     };
     window.addEventListener("resize", () => {
       if (gen === runGen) viewDirty = true;
@@ -1205,6 +1219,10 @@ const view = {
   //
   // Render-time: the index buffer holds every pair and this moves a draw count.
   edgePct: { near: 10, midNear: 1, further: 1 } as Record<EdgeKind, number>,
+  // Percent, matching EDGE_ALPHA's 0.35 default. Live, like edgePct: this
+  // rewrites the alpha float already sitting in each kind's EdgeStyle slot,
+  // no buffer rebuilt and no shader touched.
+  edgeAlpha: 35,
 };
 
 /** Installed by a run so an edit can rewrite that run's view uniform. */
@@ -1448,6 +1466,7 @@ pacmapFolder
 function syncComponents(d: Components) {
   setCameraMode(d);
   occlusionBinding.disabled = d === 2;
+  edgeAlphaBinding.disabled = !occlusionBinding.disabled && view.occlusion;
 }
 
 /**
@@ -1564,7 +1583,13 @@ viewFolder
 // live phase dirty enough to have one.
 const occlusionBinding = viewFolder
   .addBinding(view, "occlusion", { label: "occlusion" })
-  .on("change", () => onViewChange?.());
+  .on("change", () => {
+    onViewChange?.();
+    // Occlusion forces edge alpha to 1.0 in the shader (see edgeWGSL), so the
+    // opacity slider is dead weight while it's on — grey it rather than leave
+    // a live-looking control that does nothing.
+    edgeAlphaBinding.disabled = !occlusionBinding.disabled && view.occlusion;
+  });
 // All three ride in the view uniform like `occlusion`, so there is nothing to
 // install for them either.
 viewFolder
@@ -1629,6 +1654,12 @@ viewFolder
 const edgeFolder = pane.addFolder({ title: EDGE_TITLE });
 edgeFolder
   .addBinding(view, "edges", { label: "show edges" })
+  .on("change", () => onViewChange?.());
+// Greyed whenever occlusion is actually in effect (3D and the checkbox on):
+// the occluded fragment hardcodes alpha to 1.0 and ignores this entirely
+// (see edgeWGSL), so a live slider there would silently do nothing.
+const edgeAlphaBinding = edgeFolder
+  .addBinding(view, "edgeAlpha", { label: "opacity", min: 0, max: 100, step: 1 })
   .on("change", () => onViewChange?.());
 // (pos)/(neg) is the sign of the force, not of anything measured: near and
 // mid-near pull, further pushes. Mid-near's is true only for the first 200 of
